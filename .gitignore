@@ -1,0 +1,64 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# 虚拟环境（uv / venv / conda）
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 工具与缓存 =====
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+# ruff
+.ruff_cache/
+# pytest
+.pytest_cache/
+.cache/
+# coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# ===== IDE / 编辑器 =====
+.vscode/
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ===== PyQt6 / 桌面应用产物 =====
+# 打包工具（PyInstaller 等）
+*.spec
+build/
+dist/
+*.egg
+# Qt 运行时缓存
+*.qmlc
+*.jsc
+*.qmls
+qrc_*.py
+# 用户配置与日志
+*.log
+logs/
+
+# ===== 系统临时文件 =====
+Thumbs.db
+Desktop.ini
+.DS_Store
