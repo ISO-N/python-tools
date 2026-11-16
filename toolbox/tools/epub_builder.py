@@ -15,12 +15,15 @@ import threading
 import uuid
 import warnings
 import zipfile
+from collections import deque
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from xml.sax.saxutils import escape, quoteattr
 
-from PIL import Image
+from PIL import Image, ImageOps
+from PyQt6.QtCore import Qt, QThread, QTimer
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -37,15 +40,24 @@ from PyQt6.QtWidgets import (
 )
 
 from toolbox.common import natural_path_key, open_directory
-from toolbox.images import load_oriented, scan_image_files
+from toolbox.images import scan_image_files
 from toolbox.page import ToolPage
 from toolbox.ui import PAGE_MARGINS, add_path_row, make_form
-from toolbox.workers import Cancelled, SingleTaskWorker, shutdown_worker
+from toolbox.workers import (
+    MAX_IMAGE_WORKERS,
+    Cancelled,
+    SingleTaskWorker,
+)
 
 EPUB_MIMETYPE = "application/epub+zip"
 JPEG_QUALITY = 92
 XHTML_MEDIA_TYPE = "application/xhtml+xml"
 NCX_MEDIA_TYPE = "application/x-dtbncx+xml"
+
+#: 预览树的图片节点上限；超过后按章节懒加载。
+PREVIEW_IMAGE_NODE_LIMIT = 2000
+#: 超过该大小的图片单独提交 normalize，避免内存峰值失控。
+LARGE_IMAGE_BYTES = 16 * 1024 * 1024
 
 # (manifest id, href, media-type)
 ManifestItem = tuple[str, str, str]
@@ -88,6 +100,8 @@ class BookPlan:
     cover: Path | None
     skipped: list[tuple[Path, str]]
     total_images: int
+    #: (目录路径, st_mtime_ns) 快照，供界面判断计划是否仍然有效。
+    fingerprint: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass
@@ -107,12 +121,16 @@ def _is_hidden(name: str) -> bool:
     return name.startswith(".")
 
 
-def _find_cover_image(root: Path) -> Path | None:
-    """查找根目录下文件名主干为 cover 的图片（大小写不敏感）。"""
-    for path in scan_image_files(root, recursive=False):
+def _find_cover_in(images: Sequence[Path]) -> Path | None:
+    for path in images:
         if path.stem.casefold() == "cover":
             return path
     return None
+
+
+def _find_cover_image(root: Path) -> Path | None:
+    """查找根目录下文件名主干为 cover 的图片（大小写不敏感）。"""
+    return _find_cover_in(scan_image_files(root, recursive=False))
 
 
 def discover_book(
@@ -120,6 +138,8 @@ def discover_book(
     *,
     mode: str = "chapters",
     include_root_images: bool = True,
+    cancel_event: threading.Event | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> BookPlan:
     """扫描输入目录并生成书籍组织方案。
 
@@ -132,6 +152,8 @@ def discover_book(
     根目录下名为 ``cover`` 的图片同样自动识别为封面并从正文中排除。
 
     空章节会被忽略；目录中没有任何图片时抛出 ``ValueError``。
+    ``cancel_event`` 在每次目录扫描前检查，取消时抛出
+    :class:`toolbox.errors.Cancelled`；``on_progress`` 接收累计发现的图片数。
     """
     root = Path(input_root)
     if mode not in {"chapters", "single"}:
@@ -139,12 +161,58 @@ def discover_book(
     if not root.is_dir():
         raise ValueError(f"输入目录不存在：{root}")
 
+    fingerprint: list[tuple[str, int]] = []
+    found_total = 0
+
+    def check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled()
+
+    def record_directory(directory: Path) -> None:
+        try:
+            info = directory.stat()
+        except OSError:
+            return
+        fingerprint.append((str(directory), info.st_mtime_ns))
+
+    def scan_directory(directory: Path, *, recursive: bool) -> list[Path]:
+        record_directory(directory)
+        if on_progress is None:
+            return scan_image_files(
+                directory,
+                recursive=recursive,
+                cancel_event=cancel_event,
+            )
+
+        last = 0
+
+        def report(found: int) -> None:
+            nonlocal found_total, last
+            found_total += found - last
+            last = found
+            on_progress(found_total)
+
+        return scan_image_files(
+            directory,
+            recursive=recursive,
+            cancel_event=cancel_event,
+            on_progress=report,
+        )
+
     if mode == "single":
-        cover = _find_cover_image(root)
+        check_cancelled()
+        all_images = scan_directory(root, recursive=True)
+        cover = next(
+            (
+                path
+                for path in all_images
+                if path.parent == root
+                and path.stem.casefold() == "cover"
+            ),
+            None,
+        )
         images = [
-            path
-            for path in scan_image_files(root, recursive=True)
-            if cover is None or path != cover
+            path for path in all_images if cover is None or path != cover
         ]
         if not images and cover is None:
             raise ValueError("目录中没有找到图片文件")
@@ -156,6 +224,7 @@ def discover_book(
             cover=cover,
             skipped=[],
             total_images=len(images) + (1 if cover is not None else 0),
+            fingerprint=tuple(fingerprint),
         )
 
     subdirs = [
@@ -167,13 +236,13 @@ def discover_book(
     ]
     subdirs.sort(key=lambda path: natural_path_key(path.name))
 
-    cover = _find_cover_image(root)
+    check_cancelled()
+    root_scan = scan_directory(root, recursive=False)
+    cover = _find_cover_in(root_scan)
     root_images: list[Path] = []
     if include_root_images:
         root_images = [
-            path
-            for path in scan_image_files(root, recursive=False)
-            if cover is None or path != cover
+            path for path in root_scan if cover is None or path != cover
         ]
 
     chapters: list[Chapter] = []
@@ -181,7 +250,8 @@ def discover_book(
         chapters.append(Chapter(title="正文", images=root_images))
 
     for directory in subdirs:
-        images = scan_image_files(directory, recursive=True)
+        check_cancelled()
+        images = scan_directory(directory, recursive=True)
         if images:
             chapters.append(Chapter(title=directory.name, images=images))
 
@@ -197,39 +267,159 @@ def discover_book(
         cover=cover,
         skipped=[],
         total_images=total_images,
+        fingerprint=tuple(fingerprint),
     )
+
+
+def book_plan_is_current(plan: BookPlan) -> bool:
+    """检查计划记录的各目录 mtime 是否仍与磁盘一致。"""
+    if not plan.fingerprint:
+        return False
+    for directory, mtime_ns in plan.fingerprint:
+        try:
+            if Path(directory).stat().st_mtime_ns != mtime_ns:
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def _has_alpha(image: Image.Image) -> bool:
     return "A" in image.getbands() or "transparency" in image.info
 
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _png_orientation(raw: bytes) -> int:
+    """从 PNG 的 eXIf 块读取方向，避免 ``getexif()`` 触发完整解码。"""
+    if not raw.startswith(_PNG_SIGNATURE):
+        return 1
+    position = len(_PNG_SIGNATURE)
+    limit = len(raw) - 4
+    while position + 8 <= limit:
+        length = int.from_bytes(raw[position : position + 4], "big")
+        chunk_type = raw[position + 4 : position + 8]
+        data_start = position + 8
+        data_end = data_start + length
+        if data_end + 4 > len(raw):
+            break
+        if chunk_type == b"eXIf":
+            try:
+                exif = Image.Exif()
+                exif.load(raw[data_start:data_end])
+                return int(exif.get(0x0112, 1) or 1)
+            except Exception:  # noqa: BLE001 - EXIF 损坏时按正常方向处理
+                return 1
+        if chunk_type == b"IEND":
+            break
+        position = data_end + 4
+    return 1
+
+
+def _encode_loaded_image(
+    image: Image.Image,
+    image_format: str,
+    frames: int,
+    orientation: int,
+    name: str,
+) -> tuple[bytes, str, str]:
+    """在已打开的图像上完成方向转正与重新编码。"""
+    try:
+        image.load()
+    except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
+        raise ValueError(f"无法读取图片「{name}」：{exc}") from exc
+
+    source_image = image
+    transposed: Image.Image | None = None
+    if orientation != 1:
+        try:
+            ImageOps.exif_transpose(image, in_place=True)
+        except TypeError:  # 旧版 Pillow 没有 in_place 参数
+            transposed = ImageOps.exif_transpose(image)
+            source_image = transposed
+
+    try:
+        try:
+            animated = image_format in {"GIF", "WEBP"} and frames > 1
+            alpha = _has_alpha(source_image)
+
+            if animated or alpha:
+                target = (
+                    source_image.convert("RGBA")
+                    if alpha
+                    else source_image.convert("RGB")
+                )
+                try:
+                    buffer = io.BytesIO()
+                    target.save(buffer, format="PNG", optimize=True)
+                    return buffer.getvalue(), "image/png", "png"
+                finally:
+                    target.close()
+
+            source = source_image
+            converted: Image.Image | None = None
+            if source_image.mode not in {"RGB", "L"}:
+                converted = source_image.convert("RGB")
+                source = converted
+            try:
+                buffer = io.BytesIO()
+                source.save(
+                    buffer,
+                    format="JPEG",
+                    quality=JPEG_QUALITY,
+                    optimize=True,
+                )
+                return buffer.getvalue(), "image/jpeg", "jpg"
+            finally:
+                if converted is not None:
+                    converted.close()
+        except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
+            raise ValueError(f"无法编码图片「{name}」：{exc}") from exc
+    finally:
+        if transposed is not None:
+            transposed.close()
+
+
 def normalize_epub_image(path: Path | str) -> tuple[bytes, str, str]:
     """把图片转换为 EPUB2 可用的数据。
 
     返回 ``(数据, media_type, 扩展名)``，扩展名不带点，只会是 ``jpg`` 或
-    ``png``。方向为 1 且模式兼容的 JPEG / PNG 直接复用原文件字节；其余图片
-    转正方向后重新编码：有透明通道输出 PNG RGBA，否则输出 JPEG（quality=92）。
-    动画 GIF / WebP 只取第一帧并输出 PNG。无法读取或编码时抛出中文
-    ``ValueError``。
+    ``png``。方向为 1 且模式兼容的 JPEG / PNG 复用原文件字节，并用
+    ``verify()`` 做完整性检查；其余图片在内存流上解码、转正方向后重新编码：
+    有透明通道输出 PNG RGBA，否则输出 JPEG（quality=92）。动画 GIF / WebP
+    只取第一帧并输出 PNG。无法读取或编码时抛出中文 ``ValueError``。
     """
     path = Path(path)
 
-    # 先探测格式/EXIF 方向/动画帧数；对可直接复用的图片完整解码一次，
-    # 以便发现被截断或损坏的文件。
+    try:
+        raw = path.read_bytes()
+    except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
+        raise ValueError(f"无法读取图片「{path.name}」：{exc}") from exc
+
+    image_format = ""
+    frames = 1
+    orientation = 1
     try:
         with warnings.catch_warnings():
             warnings.simplefilter(
                 "error", Image.DecompressionBombWarning
             )
-            with Image.open(path) as probe:
-                image_format = (probe.format or "").upper()
-                image_mode = probe.mode
-                frames = getattr(probe, "n_frames", 1)
-                try:
-                    orientation = probe.getexif().get(0x0112, 1)
-                except Exception:  # noqa: BLE001 - EXIF 损坏时按正常方向处理
-                    orientation = 1
+            with Image.open(io.BytesIO(raw)) as opened:
+                image_format = (opened.format or "").upper()
+                image_mode = opened.mode
+                frames = int(getattr(opened, "n_frames", 1) or 1)
+                if image_format == "PNG":
+                    # PNG 的 getexif() 在缺少 eXIf 时会 load()，破坏
+                    # verify() 且失去复用原字节的意义。
+                    orientation = _png_orientation(raw)
+                else:
+                    try:
+                        orientation = int(
+                            opened.getexif().get(0x0112, 1) or 1
+                        )
+                    except Exception:  # noqa: BLE001 - EXIF 损坏按正常方向
+                        orientation = 1
 
                 reusable = (
                     orientation == 1
@@ -245,57 +435,44 @@ def normalize_epub_image(path: Path | str) -> tuple[bytes, str, str]:
                         )
                     )
                 )
+                verify_failed = False
                 if reusable:
-                    probe.load()
-                    data = path.read_bytes()
-                    if image_format == "JPEG":
-                        return data, "image/jpeg", "jpg"
-                    return data, "image/png", "png"
-    except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
-        raise ValueError(f"无法读取图片「{path.name}」：{exc}") from exc
+                    try:
+                        # verify() 会消耗图像对象，但不需要完整解码。
+                        opened.verify()
+                    except Exception:  # noqa: BLE001 - 回退到重新编码
+                        verify_failed = True
+                    else:
+                        if image_format == "JPEG":
+                            return raw, "image/jpeg", "jpg"
+                        return raw, "image/png", "png"
 
-    try:
-        image = load_oriented(path)
-    except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
-        raise ValueError(f"无法读取图片「{path.name}」：{exc}") from exc
+                if not verify_failed:
+                    return _encode_loaded_image(
+                        opened,
+                        image_format,
+                        frames,
+                        orientation,
+                        path.name,
+                    )
 
-    try:
-        animated = image_format in {"GIF", "WEBP"} and frames > 1
-        alpha = _has_alpha(image)
-
-        if animated or alpha:
-            if alpha:
-                target = image.convert("RGBA")
-            else:
-                target = image.convert("RGB")
-            try:
-                buffer = io.BytesIO()
-                target.save(buffer, format="PNG", optimize=True)
-                return buffer.getvalue(), "image/png", "png"
-            finally:
-                target.close()
-
-        source = image
-        converted: Image.Image | None = None
-        if image.mode not in {"RGB", "L"}:
-            converted = image.convert("RGB")
-            source = converted
-        try:
-            buffer = io.BytesIO()
-            source.save(
-                buffer,
-                format="JPEG",
-                quality=JPEG_QUALITY,
-                optimize=True,
+        # verify() 失败后对象不可再用，从同一份内存字节重新打开。
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "error", Image.DecompressionBombWarning
             )
-            return buffer.getvalue(), "image/jpeg", "jpg"
-        finally:
-            if converted is not None:
-                converted.close()
+            with Image.open(io.BytesIO(raw)) as reopened:
+                return _encode_loaded_image(
+                    reopened,
+                    image_format,
+                    frames,
+                    orientation,
+                    path.name,
+                )
+    except ValueError:
+        raise
     except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
-        raise ValueError(f"无法编码图片「{path.name}」：{exc}") from exc
-    finally:
-        image.close()
+        raise ValueError(f"无法读取图片「{path.name}」：{exc}") from exc
 
 
 # ----------------------------------------------------------------- XML 构造
@@ -512,6 +689,23 @@ def build_css() -> str:
 # ------------------------------------------------------------------- 构建逻辑
 
 
+def _write_stored_image(
+    archive: zipfile.ZipFile, name: str, data: bytes
+) -> None:
+    """图片以不压缩方式写入（JPEG/PNG 本身已压缩）。"""
+    info = zipfile.ZipInfo(name)
+    info.compress_type = zipfile.ZIP_STORED
+    archive.writestr(info, data)
+
+
+def _is_large_image(path: Path) -> bool:
+    """图片是否超过并行 normalize 的单文件内存预算。"""
+    try:
+        return path.stat().st_size > LARGE_IMAGE_BYTES
+    except OSError:
+        return False
+
+
 def build_epub(
     plan: BookPlan,
     metadata: BookMetadata,
@@ -596,8 +790,10 @@ def build_epub(
                     skipped.append((cover_path, str(exc)))
                 else:
                     cover_file_name = f"cover.{extension}"
-                    archive.writestr(
-                        f"OEBPS/images/{cover_file_name}", data
+                    _write_stored_image(
+                        archive,
+                        f"OEBPS/images/{cover_file_name}",
+                        data,
                     )
                     manifest.append(
                         (
@@ -622,23 +818,73 @@ def build_epub(
                     )
                     spine_ids.append("cover")
 
-            # 正文图片按成功顺序全局编号；某章全部失败时不生成该章 XHTML。
+            # 正文图片只并行 normalize；zip 写入、manifest 与编号全部留在
+            # 当前线程，并按章 / 图的输入顺序消费 future，保证输出与串行
+            # 实现逐字节一致。某章图片全部失败时不生成该章 XHTML。
+            entries: list[tuple[int, Path]] = []
+            chapter_images_by_index: list[list[str]] = [
+                [] for _chapter in plan.chapters
+            ]
+            chapter_ends: list[int] = []
+            for chapter_index, chapter in enumerate(plan.chapters):
+                entries.extend(
+                    (chapter_index, image)
+                    for image in chapter.images
+                )
+                chapter_ends.append(len(entries))
+
             image_serial = 0
-            for chapter in plan.chapters:
-                chapter_images: list[str] = []
-                for image_path in chapter.images:
+            next_index = 0
+            consumed = 0
+            chapter_cursor = 0
+            window = max(1, MAX_IMAGE_WORKERS * 2)
+            pending: deque[
+                Future[tuple[bytes, str, str]]
+            ] = deque()
+            executor = ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS)
+            try:
+                while consumed < len(entries):
                     check_cancelled()
-                    try:
-                        data, media_type, extension = normalize_epub_image(
-                            image_path
+                    # 预取窗口：大文件前先排空已有任务，单独提交大文件。
+                    while (
+                        next_index < len(entries)
+                        and len(pending) < window
+                    ):
+                        check_cancelled()
+                        image_path = entries[next_index][1]
+                        if _is_large_image(image_path):
+                            if pending:
+                                break
+                            pending.append(
+                                executor.submit(
+                                    normalize_epub_image, image_path
+                                )
+                            )
+                            next_index += 1
+                            break
+                        pending.append(
+                            executor.submit(
+                                normalize_epub_image, image_path
+                            )
                         )
+                        next_index += 1
+
+                    if not pending:
+                        continue
+
+                    chapter_index, image_path = entries[consumed]
+                    future = pending.popleft()
+                    try:
+                        data, media_type, extension = future.result()
                     except Exception as exc:  # noqa: BLE001 - 跳过损坏图片
                         skipped.append((image_path, str(exc)))
                     else:
                         image_serial += 1
                         file_name = f"img_{image_serial:04d}.{extension}"
-                        archive.writestr(
-                            f"OEBPS/images/{file_name}", data
+                        _write_stored_image(
+                            archive,
+                            f"OEBPS/images/{file_name}",
+                            data,
                         )
                         manifest.append(
                             (
@@ -647,32 +893,62 @@ def build_epub(
                                 media_type,
                             )
                         )
-                        chapter_images.append(file_name)
+                        chapter_images_by_index[
+                            chapter_index
+                        ].append(file_name)
                         images_written += 1
 
+                    consumed += 1
                     processed += 1
                     if on_progress is not None:
                         on_progress(processed, total_images)
 
-                if not chapter_images:
-                    continue
-
-                chapter_count += 1
-                xhtml_name = f"chapter_{chapter_count:03d}.xhtml"
-                archive.writestr(
-                    f"OEBPS/{xhtml_name}",
-                    build_chapter_xhtml(
-                        chapter.title,
-                        chapter_images,
-                        metadata.language,
-                    ).encode("utf-8"),
-                )
-                chapter_id = f"chapter_{chapter_count:03d}"
-                manifest.append(
-                    (chapter_id, xhtml_name, XHTML_MEDIA_TYPE)
-                )
-                spine_ids.append(chapter_id)
-                nav_entries.append((chapter.title, xhtml_name))
+                    while (
+                        chapter_cursor < len(chapter_ends)
+                        and chapter_ends[chapter_cursor] <= consumed
+                    ):
+                        chapter_images = chapter_images_by_index[
+                            chapter_cursor
+                        ]
+                        if chapter_images:
+                            chapter_count += 1
+                            xhtml_name = (
+                                f"chapter_{chapter_count:03d}.xhtml"
+                            )
+                            archive.writestr(
+                                f"OEBPS/{xhtml_name}",
+                                build_chapter_xhtml(
+                                    plan.chapters[
+                                        chapter_cursor
+                                    ].title,
+                                    chapter_images,
+                                    metadata.language,
+                                ).encode("utf-8"),
+                            )
+                            chapter_id = (
+                                f"chapter_{chapter_count:03d}"
+                            )
+                            manifest.append(
+                                (
+                                    chapter_id,
+                                    xhtml_name,
+                                    XHTML_MEDIA_TYPE,
+                                )
+                            )
+                            spine_ids.append(chapter_id)
+                            nav_entries.append(
+                                (
+                                    plan.chapters[
+                                        chapter_cursor
+                                    ].title,
+                                    xhtml_name,
+                                )
+                            )
+                        chapter_cursor += 1
+                check_cancelled()
+            finally:
+                # 取消或异常时停止提交并等待运行中的 normalize 结束。
+                executor.shutdown(wait=True, cancel_futures=True)
 
             if images_written == 0:
                 sample = ""
@@ -726,6 +1002,8 @@ def build_epub(
 class EpubBuilderPage(ToolPage):
     """EPUB 2 电子书生成工具页。"""
 
+    shutdown_label = "生成"
+
     def __init__(self) -> None:
         super().__init__()
         self._worker: SingleTaskWorker | None = None
@@ -735,8 +1013,17 @@ class EpubBuilderPage(ToolPage):
         self._auto_cover: str | None = None
         self._input_widgets: list[QWidget] = []
         self._browse_buttons: list[QWidget] = []
+        self._plan: BookPlan | None = None
+        self._plan_key: tuple[str, str, bool] | None = None
+        self._preview_metadata: BookMetadata | None = None
+        self._preview_key: tuple[str, str, bool] | None = None
+        self._preview_plan: BookPlan | None = None
+        self._build_key: tuple[str, str, bool] | None = None
         self._build_ui()
         self._sync_mode_controls()
+
+    def current_worker(self) -> QThread | None:
+        return self._worker
 
     # ------------------------------------------------------------------ UI
 
@@ -867,11 +1154,22 @@ class EpubBuilderPage(ToolPage):
             self.start_btn,
         ]
 
+        self._cover_timer = QTimer(self)
+        self._cover_timer.setSingleShot(True)
+        self._cover_timer.setInterval(300)
+        self._cover_timer.timeout.connect(self._autodetect_cover)
+
         self.input_edit.textChanged.connect(self._on_input_changed)
         self.output_edit.textEdited.connect(self._on_output_edited)
         self.cover_edit.textEdited.connect(self._on_cover_edited)
         self.mode_combo.currentIndexChanged.connect(
             self._sync_mode_controls
+        )
+        self.include_root_check.toggled.connect(
+            self._on_plan_options_changed
+        )
+        self.preview_tree.itemExpanded.connect(
+            self._on_preview_item_expanded
         )
 
     def _on_output_edited(self, _text: str) -> None:
@@ -881,8 +1179,13 @@ class EpubBuilderPage(ToolPage):
         self._auto_cover = None
 
     def _on_input_changed(self, _text: str) -> None:
+        # 输出路径立即更新；封面探测延后 300 ms，避免逐字符扫描目录。
         self._update_default_output()
-        self._autodetect_cover()
+        self._cover_timer.start()
+
+    def _on_plan_options_changed(self, *_args: object) -> None:
+        # 目录模式变化会使已缓存的计划失效。
+        self._cover_timer.start()
 
     def _update_default_output(self) -> None:
         text = self.input_edit.text().strip()
@@ -897,6 +1200,34 @@ class EpubBuilderPage(ToolPage):
             self._auto_output = default_output
             self.output_edit.setText(default_output)
 
+    @staticmethod
+    def _plan_cache_key(
+        input_root: Path, mode: str, include_root: bool
+    ) -> tuple[str, str, bool]:
+        return (str(input_root), mode, bool(include_root))
+
+    def _current_plan(self) -> BookPlan | None:
+        """返回与当前输入及磁盘状态一致的计划，否则返回 None。"""
+        plan = self._plan
+        if plan is None:
+            return None
+        text = self.input_edit.text().strip()
+        if not text:
+            return None
+        try:
+            root = Path(text).expanduser()
+        except (OSError, RuntimeError):
+            return None
+        mode = str(self.mode_combo.currentData() or "chapters")
+        key = self._plan_cache_key(
+            root, mode, self.include_root_check.isChecked()
+        )
+        if key != self._plan_key:
+            return None
+        if not book_plan_is_current(plan):
+            return None
+        return plan
+
     def _autodetect_cover(self) -> None:
         text = self.input_edit.text().strip()
         if not text:
@@ -907,10 +1238,14 @@ class EpubBuilderPage(ToolPage):
         current = self.cover_edit.text().strip()
         if current and current != self._auto_cover:
             return
-        try:
-            found = _find_cover_image(root)
-        except OSError:
-            return
+        plan = self._current_plan()
+        if plan is not None:
+            found = plan.cover
+        else:
+            try:
+                found = _find_cover_image(root)
+            except OSError:
+                return
         if found is not None:
             self._auto_cover = str(found)
             if self.cover_edit.text().strip() != self._auto_cover:
@@ -928,6 +1263,9 @@ class EpubBuilderPage(ToolPage):
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
+        if busy:
+            # 避免已排队的封面探测在后台任务期间又扫描目录。
+            self._cover_timer.stop()
         for widget in self._input_widgets:
             widget.setEnabled(not busy)
         self.start_btn.setEnabled(not busy)
@@ -1001,27 +1339,6 @@ class EpubBuilderPage(ToolPage):
             metadata,
         )
 
-    def _collect_plan(self) -> tuple[BookPlan, BookMetadata] | None:
-        collected = self._collect_common()
-        if collected is None:
-            return None
-        input_root, mode, include_root, metadata = collected
-        try:
-            plan = discover_book(
-                input_root,
-                mode=mode,
-                include_root_images=include_root,
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "无法读取图片目录", str(exc))
-            return None
-        except OSError as exc:
-            QMessageBox.critical(
-                self, "无法读取图片目录", f"{input_root}\n{exc}"
-            )
-            return None
-        return plan, metadata
-
     def _prepare_output(self) -> Path | None:
         """校验输出路径、补齐 .epub 后缀并确认覆盖。"""
         text = self.output_edit.text().strip()
@@ -1073,81 +1390,206 @@ class EpubBuilderPage(ToolPage):
     def _preview(self) -> None:
         if self._busy:
             return
-        collected = self._collect_plan()
+        collected = self._collect_common()
         if collected is None:
             return
-        plan, metadata = collected
-        self._populate_preview(plan, metadata)
+        input_root, mode, include_root, metadata = collected
+        cached = self._current_plan()
+        if cached is not None:
+            self._populate_preview(cached, metadata)
+            return
+
+        def task(
+            on_progress: Callable[[object, object], None],
+            cancel_event: threading.Event,
+        ) -> BookPlan:
+            return discover_book(
+                input_root,
+                mode=mode,
+                include_root_images=include_root,
+                cancel_event=cancel_event,
+                on_progress=lambda found: on_progress(found, 0),
+            )
+
+        self._preview_key = self._plan_cache_key(
+            input_root, mode, include_root
+        )
+        self._preview_metadata = metadata
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self._set_busy(True)
+        self._set_status("正在扫描图片目录…")
+        worker = SingleTaskWorker(task, self)
+        worker.progress_changed.connect(self._on_progress)
+        worker.task_finished.connect(self._on_preview_finished)
+        worker.task_cancelled.connect(self._on_preview_cancelled)
+        worker.task_failed.connect(self._on_preview_failed)
+        worker.finished.connect(self._on_worker_finished)
+        self._worker = worker
+        worker.start()
+
+    def _on_preview_finished(self, result: object) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if not isinstance(result, BookPlan):
+            self._on_preview_failed("后台任务返回了未知结果")
+            return
+        metadata = self._preview_metadata
+        if metadata is None:
+            self._on_preview_failed("预览缺少书籍信息")
+            return
+        self._plan = result
+        self._plan_key = self._preview_key
+        self._populate_preview(result, metadata)
+
+    def _on_preview_cancelled(self, _result: object) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status("已取消预览")
+
+    def _on_preview_failed(self, message: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status("预览失败")
+        QMessageBox.warning(self, "无法读取图片目录", message)
 
     def _populate_preview(
         self, plan: BookPlan, metadata: BookMetadata
     ) -> None:
-        self.preview_tree.clear()
         body_count = sum(len(chapter.images) for chapter in plan.chapters)
-
         cover = (
             metadata.cover_path
             if metadata.cover_path is not None
             else plan.cover
         )
-        if cover is not None:
-            cover_item = QTreeWidgetItem(["封面（不进入正文）", "1"])
-            cover_item.setToolTip(0, str(cover))
-            QTreeWidgetItem(cover_item, [cover.name, ""])
-            self.preview_tree.addTopLevelItem(cover_item)
+        lazy = plan.total_images > PREVIEW_IMAGE_NODE_LIMIT
 
-        for chapter in plan.chapters:
-            item = QTreeWidgetItem(
-                [chapter.title, str(len(chapter.images))]
-            )
-            for image in chapter.images:
-                child = QTreeWidgetItem([image.name, ""])
-                child.setToolTip(0, str(image))
-                item.addChild(child)
-            self.preview_tree.addTopLevelItem(item)
+        self._preview_plan = None
+        self.preview_tree.setUpdatesEnabled(False)
+        try:
+            self.preview_tree.clear()
 
-        for column in (0, 1):
-            self.preview_tree.resizeColumnToContents(column)
-        self.preview_tree.expandToDepth(0)
+            if cover is not None:
+                cover_item = QTreeWidgetItem(
+                    ["封面（不进入正文）", "1"]
+                )
+                cover_item.setToolTip(0, str(cover))
+                QTreeWidgetItem(cover_item, [cover.name, ""])
+                self.preview_tree.addTopLevelItem(cover_item)
+
+            for index, chapter in enumerate(plan.chapters):
+                item = QTreeWidgetItem(
+                    [chapter.title, str(len(chapter.images))]
+                )
+                if lazy:
+                    item.setData(
+                        0, Qt.ItemDataRole.UserRole, index
+                    )
+                    placeholder = QTreeWidgetItem(
+                        ["展开章节查看图片", ""]
+                    )
+                    placeholder.setData(
+                        0, Qt.ItemDataRole.UserRole, -1
+                    )
+                    item.addChild(placeholder)
+                else:
+                    for image in chapter.images:
+                        child = QTreeWidgetItem([image.name, ""])
+                        child.setToolTip(0, str(image))
+                        item.addChild(child)
+                self.preview_tree.addTopLevelItem(item)
+
+            if not lazy:
+                for column in (0, 1):
+                    self.preview_tree.resizeColumnToContents(column)
+                self.preview_tree.expandToDepth(0)
+        finally:
+            self.preview_tree.setUpdatesEnabled(True)
+        self._preview_plan = plan
 
         cover_text = cover.name if cover is not None else "无"
+        suffix = "；图片较多，展开章节查看" if lazy else ""
         self._set_status(
             f"预览：{len(plan.chapters)} 章 / {body_count} 张正文图片，"
             f"封面：{cover_text}，共 {plan.total_images} 张图片"
+            f"{suffix}"
         )
+
+    def _on_preview_item_expanded(self, item: QTreeWidgetItem) -> None:
+        """大目录预览：首次展开章节时再创建该章的图片节点。"""
+        index = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(index, int) or index < 0:
+            return
+        plan = self._preview_plan
+        if plan is None or index >= len(plan.chapters):
+            return
+        if item.childCount() != 1:
+            return
+        placeholder = item.child(0)
+        if placeholder.data(0, Qt.ItemDataRole.UserRole) != -1:
+            return
+
+        item.takeChildren()
+        self.preview_tree.setUpdatesEnabled(False)
+        try:
+            for image in plan.chapters[index].images:
+                child = QTreeWidgetItem([image.name, ""])
+                child.setToolTip(0, str(image))
+                item.addChild(child)
+        finally:
+            self.preview_tree.setUpdatesEnabled(True)
 
     # --------------------------------------------------------------- 生成流程
 
     def _start_build(self) -> None:
         if self._busy:
             return
-        collected = self._collect_plan()
+        collected = self._collect_common()
         if collected is None:
             return
-        plan, metadata = collected
+        input_root, mode, include_root, metadata = collected
         output = self._prepare_output()
         if output is None:
             return
 
+        cached = self._current_plan()
         self._last_output = output
-        self.progress_bar.setValue(0)
-        self._set_busy(True)
-        self._set_status(
-            f"正在生成 EPUB：{len(plan.chapters)} 章，"
-            f"共 {plan.total_images} 张图片…"
+        self._build_key = self._plan_cache_key(
+            input_root, mode, include_root
         )
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if cached is None:
+            self.progress_bar.setRange(0, 0)
+            self._set_status("正在扫描图片目录…")
+        else:
+            self._set_status(
+                f"正在生成 EPUB：{len(cached.chapters)} 章，"
+                f"共 {cached.total_images} 张图片…"
+            )
+        self._set_busy(True)
 
         def task(
             on_progress: Callable[[object, object], None],
             cancel_event: threading.Event,
-        ) -> EpubResult:
-            return build_epub(
+        ) -> tuple[EpubResult, BookPlan]:
+            plan = cached
+            if plan is None:
+                plan = discover_book(
+                    input_root,
+                    mode=mode,
+                    include_root_images=include_root,
+                    cancel_event=cancel_event,
+                    on_progress=lambda found: on_progress(found, 0),
+                )
+            result = build_epub(
                 plan,
                 metadata,
                 output,
                 cancel_event=cancel_event,
                 on_progress=on_progress,
             )
+            return result, plan
 
         worker = SingleTaskWorker(task, self)
         worker.progress_changed.connect(self._on_progress)
@@ -1161,17 +1603,31 @@ class EpubBuilderPage(ToolPage):
     def _on_progress(self, done: object, total: object) -> None:
         done_count = int(done)
         total_count = int(total)
-        percent = int(done_count / total_count * 100) if total_count else 0
-        self.progress_bar.setValue(percent)
+        if total_count <= 0:
+            self.progress_bar.setRange(0, 0)
+            self._set_status(
+                f"正在扫描图片目录：已发现 {done_count} 张…"
+            )
+            return
+        self.progress_bar.setRange(0, 100)
+        percent = int(done_count / total_count * 100)
+        self.progress_bar.setValue(min(100, percent))
         self._set_status(
             f"正在处理第 {done_count}/{total_count} 张图片…"
         )
 
     def _on_finished(self, result: object) -> None:
+        plan: BookPlan | None = None
+        if isinstance(result, tuple) and len(result) == 2:
+            result, plan = result
         if not isinstance(result, EpubResult):
             self._on_failed("任务返回了无法识别的结果。")
             return
+        if isinstance(plan, BookPlan):
+            self._plan = plan
+            self._plan_key = self._build_key
 
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         self.open_btn.setEnabled(True)
         self._last_output = result.output
@@ -1203,10 +1659,13 @@ class EpubBuilderPage(ToolPage):
         )
 
     def _on_cancelled(self, _result: object) -> None:
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self._set_status("已取消，未生成 EPUB 文件")
 
     def _on_failed(self, message: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self._set_status("生成失败")
         QMessageBox.critical(self, "生成失败", message)
 
@@ -1239,9 +1698,3 @@ class EpubBuilderPage(ToolPage):
             QMessageBox.critical(
                 self, "无法打开目录", f"{folder}\n{exc}"
             )
-
-    # ----------------------------------------------------------------- 关闭
-
-    def shutdown(self) -> bool:
-        """主窗口关闭前调用；生成进行中时确认并等待线程结束。"""
-        return shutdown_worker(self._worker, self.window(), "生成 EPUB")

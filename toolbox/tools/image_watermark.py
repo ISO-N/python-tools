@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,10 +34,24 @@ from PyQt6.QtWidgets import (
 )
 
 from toolbox.common import find_cjk_font_file, open_directory
-from toolbox.images import load_oriented, save_image_atomic, scan_image_files
+from toolbox.images import (
+    load_oriented,
+    probe_image,
+    save_image_atomic,
+    scan_image_files,
+)
 from toolbox.page import ToolPage
 from toolbox.ui import PAGE_MARGINS, add_path_row, make_form
-from toolbox.workers import BatchResult, BatchWorker, shutdown_worker
+from toolbox.workers import (
+    BatchResult,
+    BatchWorker,
+    MAX_IMAGE_WORKERS,
+    shutdown_worker,
+)
+
+# 文字渲染持有 GIL，并发收益取决于字体栅格化实现与图片尺寸。
+# 先默认使用共享的图片并发度；若基准显示无收益，可把此常量改为 1。
+WATERMARK_WORKERS = MAX_IMAGE_WORKERS
 
 FONT_SIZE_MIN, FONT_SIZE_MAX = 6, 200
 OPACITY_MIN, OPACITY_MAX = 1, 100
@@ -71,6 +86,11 @@ _ALIGNMENT = {
 }
 
 _SUPPORTED_OUTPUT_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _path_key(path: Path) -> str:
+    """生成输出路径比较键，避免对每个候选调用 ``resolve()``。"""
+    return os.path.normcase(os.path.abspath(path))
 
 
 @dataclass
@@ -148,16 +168,21 @@ def render_text_layer(
     font: ImageFont.FreeTypeFont,
     color: tuple[int, int, int],
     angle: float,
+    *,
+    opacity: float = 1.0,
 ) -> Image.Image:
     """把文字渲染到透明 RGBA 图层上并旋转，返回由调用方关闭的新图片。
 
     使用 ``ImageDraw.textbbox`` 计算文字实际外框，四周各留 2 像素边距，
-    再按 ``angle`` 以双三次插值旋转并扩展画布。
+    再按 ``angle`` 以双三次插值旋转并扩展画布。``angle == 0`` 时直接返回
+    未旋转图层；``opacity`` 在渲染阶段用 256 项 LUT 一次性应用。
     """
     if not text.strip():
         raise ValueError("水印文字不能为空")
     if len(color) != 3:
         raise ValueError("水印颜色必须是三个 0-255 的整数")
+    if not 0.0 <= float(opacity) <= 1.0:
+        raise ValueError("透明度必须在 0-1 之间")
 
     probe = Image.new("L", (1, 1))
     try:
@@ -177,13 +202,29 @@ def render_text_layer(
             font=font,
             fill=(int(color[0]), int(color[1]), int(color[2]), 255),
         )
+        if opacity < 1.0:
+            alpha = layer.getchannel("A")
+            try:
+                adjusted = alpha.point(
+                    [int(value * opacity) for value in range(256)]
+                )
+            finally:
+                alpha.close()
+            try:
+                layer.putalpha(adjusted)
+            finally:
+                adjusted.close()
+        if angle == 0:
+            return layer
         rotated = layer.rotate(
             angle,
             expand=True,
             resample=Image.Resampling.BICUBIC,
         )
-    finally:
+    except Exception:
         layer.close()
+        raise
+    layer.close()
     return rotated
 
 
@@ -232,6 +273,75 @@ def _position_origin(
     return x, y
 
 
+def _iter_stamp_positions(
+    options: WatermarkOptions,
+    canvas_size: tuple[int, int],
+    layer_size: tuple[int, int],
+) -> Iterator[tuple[int, int]]:
+    """按排布选项逐个给出图层左上角坐标。"""
+    if options.position == TILE_POSITION:
+        step_x = layer_size[0] + options.gap
+        step_y = layer_size[1] + options.gap
+        y = options.margin
+        while y < canvas_size[1]:
+            x = options.margin
+            while x < canvas_size[0]:
+                yield x, y
+                x += step_x
+            y += step_y
+        return
+    yield _position_origin(
+        options.position, canvas_size, layer_size, options.margin
+    )
+
+
+def apply_watermark_rgb(
+    image: Image.Image,
+    options: WatermarkOptions,
+    layer: Image.Image,
+) -> Image.Image:
+    """RGB 快路径：把已渲染图层直接 ``paste`` 到 RGB 底图。
+
+    已是 RGB 的 ``image`` 会被原地修改（调用方拥有该图片时最省内存）；
+    其他模式先 ``convert("RGB")``。平铺时对每个位置直接粘贴，不创建
+    全尺寸 overlay；越界部分由 Pillow 自动裁剪。
+    """
+    _validate_options(options)
+    base = image if image.mode == "RGB" else image.convert("RGB")
+    try:
+        for x, y in _iter_stamp_positions(
+            options, base.size, layer.size
+        ):
+            base.paste(layer, (x, y), layer)
+    except Exception:
+        if base is not image:
+            base.close()
+        raise
+    return base
+
+
+def apply_watermark_rgba(
+    image: Image.Image,
+    options: WatermarkOptions,
+    layer: Image.Image,
+) -> Image.Image:
+    """RGBA 路径：返回带水印的新 RGBA 图片，原图保持不变。
+
+    直接把图层 ``alpha_composite`` 到属主底图上，不再创建全尺寸 overlay。
+    """
+    _validate_options(options)
+    base = image.copy() if image.mode == "RGBA" else image.convert("RGBA")
+    try:
+        for x, y in _iter_stamp_positions(
+            options, base.size, layer.size
+        ):
+            _stamp(base, layer, x, y)
+    except Exception:
+        base.close()
+        raise
+    return base
+
+
 def apply_watermark(
     image: Image.Image,
     options: WatermarkOptions,
@@ -240,46 +350,123 @@ def apply_watermark(
     """返回添加水印后的新 RGBA 图片，原图保持不变。"""
     _validate_options(options)
     layer = render_text_layer(
-        options.text, font, options.color, options.angle
+        options.text,
+        font,
+        options.color,
+        options.angle,
+        opacity=options.opacity,
     )
-    base = image.convert("RGBA")
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     try:
-        if options.opacity < 1.0:
-            alpha = layer.getchannel("A")
-            try:
-                adjusted = alpha.point(
-                    lambda value: int(value * options.opacity)
-                )
-            finally:
-                alpha.close()
-            try:
-                layer.putalpha(adjusted)
-            finally:
-                adjusted.close()
-
-        if options.position == TILE_POSITION:
-            step_x = layer.width + options.gap
-            step_y = layer.height + options.gap
-            y = options.margin
-            while y < base.height:
-                x = options.margin
-                while x < base.width:
-                    _stamp(overlay, layer, x, y)
-                    x += step_x
-                y += step_y
-        else:
-            x, y = _position_origin(
-                options.position, base.size, layer.size, options.margin
-            )
-            _stamp(overlay, layer, x, y)
-
-        return Image.alpha_composite(base, overlay)
+        return apply_watermark_rgba(image, options, layer)
     finally:
-        overlay.close()
         layer.close()
-        if base is not image:
-            base.close()
+
+
+class _ThreadRenderCache:
+    """单个线程持有的字体与文字图层缓存。"""
+
+    __slots__ = ("font", "font_key", "layers")
+
+    def __init__(self) -> None:
+        self.font: ImageFont.FreeTypeFont | None = None
+        self.font_key: tuple[object, ...] | None = None
+        self.layers: dict[tuple[object, ...], Image.Image] = {}
+
+    def close(self) -> None:
+        for layer in self.layers.values():
+            layer.close()
+        self.layers.clear()
+        font = self.font
+        self.font = None
+        self.font_key = None
+        close = getattr(font, "close", None)
+        if callable(close):
+            close()
+
+
+class WatermarkRenderer:
+    """批次级水印渲染器，按线程缓存字体与已渲染文字图层。
+
+    ``threading.local`` 保证每个线程只使用自己创建的
+    ``ImageFont.FreeTypeFont``，绝不跨线程共享。缓存键为
+    ``(text, color, angle, font_size, opacity, font_path)``。
+    ``close()`` 会关闭所有线程缓存的图层与字体。
+    """
+
+    def __init__(self, options: WatermarkOptions) -> None:
+        self._options = options
+        self._local = threading.local()
+        self._caches: list[_ThreadRenderCache] = []
+        self._lock = threading.Lock()
+
+    def _cache(self) -> _ThreadRenderCache:
+        cache = getattr(self._local, "cache", None)
+        if cache is None:
+            cache = _ThreadRenderCache()
+            self._local.cache = cache
+            with self._lock:
+                self._caches.append(cache)
+        return cache
+
+    def font_for(
+        self, options: WatermarkOptions | None = None
+    ) -> ImageFont.FreeTypeFont:
+        """返回当前线程可复用的字体。"""
+        options = options or self._options
+        cache = self._cache()
+        font_key = (options.font_path, int(options.font_size))
+        if cache.font is None or cache.font_key != font_key:
+            cache.font = load_watermark_font(options)
+            cache.font_key = font_key
+        return cache.font
+
+    def layer_for(
+        self, options: WatermarkOptions | None = None
+    ) -> Image.Image:
+        """返回当前线程缓存的文字图层；调用方不得关闭该图层。"""
+        options = options or self._options
+        key = (
+            options.text,
+            tuple(options.color),
+            options.angle,
+            int(options.font_size),
+            float(options.opacity),
+            options.font_path,
+        )
+        cache = self._cache()
+        layer = cache.layers.get(key)
+        if layer is None:
+            layer = render_text_layer(
+                options.text,
+                self.font_for(options),
+                options.color,
+                options.angle,
+                opacity=options.opacity,
+            )
+            cache.layers[key] = layer
+        return layer
+
+    def apply(
+        self,
+        image: Image.Image,
+        options: WatermarkOptions | None = None,
+        *,
+        rgb: bool = False,
+    ) -> Image.Image:
+        """用缓存图层处理一张图片；``rgb=True`` 时走 RGB 快路径。"""
+        target_options = options or self._options
+        layer = self.layer_for(target_options)
+        if rgb:
+            return apply_watermark_rgb(image, target_options, layer)
+        return apply_watermark_rgba(image, target_options, layer)
+
+    def close(self) -> None:
+        """关闭所有线程缓存的图层与字体（可重复调用）。"""
+        with self._lock:
+            caches = self._caches
+            self._caches = []
+        for cache in caches:
+            cache.close()
 
 
 def _output_format_for(src: Path) -> tuple[str, dict[str, object]]:
@@ -295,11 +482,15 @@ def watermark_one(
     src: Path | str,
     dst: Path | str,
     options: WatermarkOptions,
-    font: ImageFont.FreeTypeFont,
+    font: ImageFont.FreeTypeFont | None = None,
+    *,
+    renderer: WatermarkRenderer | None = None,
 ) -> WatermarkResult:
     """处理单张图片并保存到 dst，返回大小与尺寸信息。
 
     动画图片抛出 ``ValueError("动画图片，已跳过")``；输出目录自动创建。
+    ``renderer`` 优先于 ``font``：传入批次渲染器时复用其线程缓存图层；
+    JPEG 输出走 RGB 快路径，PNG / WebP 输出保持 RGBA 合成路径。
     """
     _validate_options(options)
     src = Path(src)
@@ -311,17 +502,36 @@ def watermark_one(
     if same_file:
         raise ValueError("输出文件不能覆盖源图片")
 
-    with Image.open(src) as probe:
-        if getattr(probe, "n_frames", 1) > 1:
-            raise ValueError("动画图片，已跳过")
+    probe = probe_image(src)
+    if probe.frames > 1:
+        raise ValueError("动画图片，已跳过")
 
     before = src.stat().st_size
     image = load_oriented(src)
+    layer: Image.Image | None = None
+    owns_layer = False
     try:
-        processed = apply_watermark(image, options, font)
+        if renderer is not None:
+            layer = renderer.layer_for(options)
+        else:
+            if font is None:
+                font = load_watermark_font(options)
+            layer = render_text_layer(
+                options.text,
+                font,
+                options.color,
+                options.angle,
+                opacity=options.opacity,
+            )
+            owns_layer = True
+
+        image_format, save_kwargs = _output_format_for(src)
+        if image_format == "JPEG":
+            processed = apply_watermark_rgb(image, options, layer)
+        else:
+            processed = apply_watermark_rgba(image, options, layer)
         try:
             width, height = processed.width, processed.height
-            image_format, save_kwargs = _output_format_for(src)
             dst.parent.mkdir(parents=True, exist_ok=True)
             save_image_atomic(
                 processed,
@@ -330,8 +540,11 @@ def watermark_one(
                 **save_kwargs,
             )
         finally:
-            processed.close()
+            if processed is not image:
+                processed.close()
     finally:
+        if owns_layer and layer is not None:
+            layer.close()
         image.close()
 
     after = dst.stat().st_size
@@ -348,11 +561,13 @@ def watermark_one(
 
 
 class ImageWatermarkPage(ToolPage):
+    shutdown_label = "水印处理"
     """批量图片文字水印工具页。"""
 
     def __init__(self) -> None:
         super().__init__()
         self._worker: BatchWorker | None = None
+        self._renderer: WatermarkRenderer | None = None
         self._busy = False
         self._font_valid = False
         self._last_output_root: Path | None = None
@@ -698,16 +913,14 @@ class ImageWatermarkPage(ToolPage):
             dst = output_root / src.relative_to(input_root)
             if dst.suffix.lower() not in _SUPPORTED_OUTPUT_SUFFIXES:
                 dst = dst.with_suffix(".png")
-            key = os.path.normcase(str(dst.resolve(strict=False))).casefold()
+            key = _path_key(dst)
             if key in used:
                 index = 2
                 while True:
                     candidate = dst.with_name(
                         f"{dst.stem} ({index}){dst.suffix}"
                     )
-                    candidate_key = os.path.normcase(
-                        str(candidate.resolve(strict=False))
-                    ).casefold()
+                    candidate_key = _path_key(candidate)
                     if candidate_key not in used:
                         dst = candidate
                         key = candidate_key
@@ -822,7 +1035,7 @@ class ImageWatermarkPage(ToolPage):
         _input_root, output_root, items, options = collected
 
         try:
-            font = load_watermark_font(options)
+            load_watermark_font(options)
         except ValueError as exc:
             self._font_valid = False
             self.font_hint.setText(str(exc))
@@ -836,18 +1049,23 @@ class ImageWatermarkPage(ToolPage):
         self._set_busy(True)
         self._set_status(f"正在为 {len(items)} 张图片添加水印…")
 
+        renderer = WatermarkRenderer(options)
+        self._renderer = renderer
+
         def process(
             item: tuple[Path, Path],
             _cancel_event: threading.Event,
         ) -> WatermarkResult:
             src, dst = item
-            return watermark_one(src, dst, options, font)
+            return watermark_one(src, dst, options, renderer=renderer)
 
         worker = BatchWorker(
             items,
             process,
             label_fn=lambda item: item[0].name,
             parent=self,
+            max_workers=WATERMARK_WORKERS,
+            progress_interval_ms=100,
         )
         worker.item_started.connect(self._on_item_started)
         worker.progress_changed.connect(self._on_progress)
@@ -919,11 +1137,18 @@ class ImageWatermarkPage(ToolPage):
         self._set_status("水印处理失败")
         QMessageBox.critical(self, "水印处理失败", message)
 
+    def _close_renderer(self) -> None:
+        renderer = self._renderer
+        self._renderer = None
+        if renderer is not None:
+            renderer.close()
+
     def _on_worker_finished(self) -> None:
         worker = self._worker
         self._worker = None
         if worker is not None:
             worker.deleteLater()
+        self._close_renderer()
         self._set_busy(False)
 
     def _cancel_watermark(self) -> None:
@@ -956,4 +1181,7 @@ class ImageWatermarkPage(ToolPage):
 
     def shutdown(self) -> bool:
         """主窗口关闭前调用；处理进行中时确认并等待线程结束。"""
-        return shutdown_worker(self._worker, self.window(), "水印处理")
+        if not shutdown_worker(self._worker, self.window(), "水印处理"):
+            return False
+        self._close_renderer()
+        return True

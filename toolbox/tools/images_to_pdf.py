@@ -10,11 +10,11 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
 import pymupdf
-from PIL import Image
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -31,15 +31,20 @@ from PyQt6.QtWidgets import (
 
 from toolbox.common import open_directory
 from toolbox.images import (
+    ImagePayload,
     fit_size,
-    image_to_bytes,
-    load_oriented,
+    prepare_image_payload,
     scan_image_files,
 )
 from toolbox.page import ToolPage
 from toolbox.pdf_utils import save_pdf_atomic
 from toolbox.ui import PAGE_MARGINS, add_path_row, make_form
-from toolbox.workers import Cancelled, SingleTaskWorker, shutdown_worker
+from toolbox.workers import (
+    Cancelled,
+    MAX_IMAGE_WORKERS,
+    SingleTaskWorker,
+    shutdown_worker,
+)
 
 A4_WIDTH_PT = 595.28
 A4_HEIGHT_PT = 841.89
@@ -47,6 +52,8 @@ MM_TO_PT = 72 / 25.4
 MARGIN_MIN_MM, MARGIN_MAX_MM = 0.0, 50.0
 DPI_MIN, DPI_MAX = 72, 600
 JPEG_QUALITY = 92
+# 大文件单独提交并排空预取窗口，避免多张原始字节同时驻留内存。
+LARGE_FILE_THRESHOLD = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -145,13 +152,44 @@ def page_geometry(
     )
 
 
-def _has_alpha(image: Image.Image) -> bool:
-    has_alpha_band = any(
-        band.lower() == "a" for band in image.getbands()
+def _prepare_payload(
+    path: Path, prefer_original: bool
+) -> ImagePayload:
+    """线程池任务：准备一张图片的可嵌入字节。"""
+    return prepare_image_payload(
+        path,
+        jpeg_quality=JPEG_QUALITY,
+        prefer_original=prefer_original,
+        optimize=False,
     )
-    return has_alpha_band or (
-        image.mode == "P" and "transparency" in image.info
+
+
+def _is_large_file(path: Path) -> bool:
+    try:
+        return path.stat().st_size > LARGE_FILE_THRESHOLD
+    except OSError:
+        return False
+
+
+def _insert_payload(
+    document: pymupdf.Document,
+    layout: PageLayout,
+    payload: ImagePayload,
+) -> None:
+    """在单线程中新建页面并插入图片；失败时删除页面后抛出。"""
+    page = document.new_page(
+        width=layout.page_width, height=layout.page_height
     )
+    try:
+        page.insert_image(
+            pymupdf.Rect(*layout.image_rect),
+            stream=payload.data,
+            keep_proportion=True,
+            alpha=0 if not payload.has_alpha else 1,
+        )
+    except Exception:
+        document.delete_page(page.number)
+        raise
 
 
 def build_pdf(
@@ -177,46 +215,121 @@ def build_pdf(
     if output.exists() and output.is_dir():
         raise ValueError(f"输出路径是一个目录：{output}")
     output_resolved = output.resolve()
-    if any(path.resolve() == output_resolved for path in image_paths):
-        raise ValueError("输出文件不能覆盖源图片")
+    output_absolute = output.absolute()
+    for path in image_paths:
+        # 先做低成本比较，只有路径相同或位于同一目录时才解析符号链接。
+        if path == output or path.absolute() == output_absolute:
+            raise ValueError("输出文件不能覆盖源图片")
+        if path.parent == output.parent and path.resolve() == output_resolved:
+            raise ValueError("输出文件不能覆盖源图片")
 
     skipped: list[tuple[Path, str]] = []
     count = 0
+    workers = max(1, int(MAX_IMAGE_WORKERS))
+    window = max(1, workers * 2)
+    executor = ThreadPoolExecutor(max_workers=workers)
+    pending: dict[int, Future[ImagePayload]] = {}
+    next_submit = 0
+
+    def cancel_now() -> None:
+        raise Cancelled(PdfBuildResult(output, count, skipped))
+
     document = pymupdf.open()
     try:
         for index, path in enumerate(image_paths, start=1):
             if cancel_event is not None and cancel_event.is_set():
-                raise Cancelled(PdfBuildResult(output, count, skipped))
+                cancel_now()
 
-            try:
-                image = load_oriented(path)
-                try:
-                    if _has_alpha(image):
-                        data, _suffix = image_to_bytes(image, "png")
-                    else:
-                        data, _suffix = image_to_bytes(
-                            image, "jpeg", quality=JPEG_QUALITY
-                        )
-                    layout = page_geometry(image.width, image.height, options)
-                finally:
-                    image.close()
-            except Exception as exc:  # noqa: BLE001 - 单张损坏时继续处理
-                skipped.append((path, str(exc)))
-            else:
-                page = document.new_page(
-                    width=layout.page_width, height=layout.page_height
+            # 只用 workers*2 的窗口预取；大文件单独提交并排空窗口。
+            while next_submit < total and len(pending) < window:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancel_now()
+                candidate = image_paths[next_submit]
+                large = _is_large_file(candidate)
+                if large and pending:
+                    break
+                pending[next_submit] = executor.submit(
+                    _prepare_payload, candidate, True
                 )
+                next_submit += 1
+                if large:
+                    break
+
+            future = pending.pop(index - 1)
+            while not future.done():
+                if cancel_event is not None and cancel_event.is_set():
+                    cancel_now()
+                wait((future,), timeout=0.1)
+            if cancel_event is not None and cancel_event.is_set():
+                cancel_now()
+
+            payload: ImagePayload | None = None
+            retry_payload: ImagePayload | None = None
+            try:
                 try:
-                    page.insert_image(
-                        pymupdf.Rect(*layout.image_rect),
-                        stream=data,
-                        keep_proportion=True,
+                    payload = future.result()
+                    layout = page_geometry(
+                        payload.width, payload.height, options
                     )
-                except Exception as exc:  # noqa: BLE001 - 单张插入失败时继续
-                    document.delete_page(page.number)
+                except Cancelled:
+                    cancel_now()
+                except Exception as exc:  # noqa: BLE001 - 单张损坏继续
                     skipped.append((path, str(exc)))
                 else:
-                    count += 1
+                    insert_failed = False
+                    try:
+                        _insert_payload(document, layout, payload)
+                    except Exception:  # noqa: BLE001 - 原字节失败重编码一次
+                        insert_failed = True
+                    if not insert_failed:
+                        count += 1
+                    else:
+                        # 先离开异常处理块并释放原字节，再准备回退编码，
+                        # 避免大文件重试时原始与重编码数据同时驻留。
+                        payload = None
+                        if (
+                            cancel_event is not None
+                            and cancel_event.is_set()
+                        ):
+                            cancel_now()
+                        retry_future = executor.submit(
+                            _prepare_payload, path, False
+                        )
+                        while not retry_future.done():
+                            if (
+                                cancel_event is not None
+                                and cancel_event.is_set()
+                            ):
+                                cancel_now()
+                            wait((retry_future,), timeout=0.1)
+                        if (
+                            cancel_event is not None
+                            and cancel_event.is_set()
+                        ):
+                            cancel_now()
+                        try:
+                            retry_payload = retry_future.result()
+                            retry_layout = page_geometry(
+                                retry_payload.width,
+                                retry_payload.height,
+                                options,
+                            )
+                        except Cancelled:
+                            cancel_now()
+                        except Exception as exc:  # noqa: BLE001 - 单张继续
+                            skipped.append((path, str(exc)))
+                        else:
+                            try:
+                                _insert_payload(
+                                    document, retry_layout, retry_payload
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                skipped.append((path, str(exc)))
+                            else:
+                                count += 1
+            finally:
+                payload = None
+                retry_payload = None
 
             if on_progress is not None:
                 on_progress(index, total)
@@ -230,6 +343,8 @@ def build_pdf(
 
         save_pdf_atomic(document, output)
     finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        pending.clear()
         document.close()
 
     return PdfBuildResult(output=output, count=count, skipped=skipped)
@@ -239,6 +354,7 @@ def build_pdf(
 
 
 class ImagesToPdfPage(ToolPage):
+    shutdown_label = "转换"
     """图片合成 PDF 工具页。"""
 
     def __init__(self) -> None:

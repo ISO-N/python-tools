@@ -27,8 +27,8 @@ from PyQt6.QtWidgets import (
 from toolbox.common import filesystem_key, open_directory
 from toolbox.images import (
     fit_size,
-    is_animated,
     load_oriented,
+    probe_image,
     save_image_atomic,
     scan_image_files,
 )
@@ -38,6 +38,7 @@ from toolbox.workers import (
     BatchResult,
     BatchWorker,
     Cancelled,
+    MAX_IMAGE_WORKERS,
     shutdown_worker,
 )
 
@@ -59,6 +60,7 @@ class ConvertOptions:
     long_edge: int = 1600
     percent: int = 100
     overwrite: bool = False
+    optimize: bool = True
 
 
 @dataclass
@@ -204,12 +206,6 @@ def plan_jobs(
     )
 
 
-def _source_is_animated(path: Path) -> bool:
-    """读取文件头判断是否为多帧图片（exif_transpose 会丢失帧信息）。"""
-    with Image.open(path) as image:
-        return is_animated(image)
-
-
 def convert_image(
     src: Path,
     dst: Path,
@@ -230,32 +226,43 @@ def convert_image(
         raise Cancelled()
     before = src.stat().st_size
 
-    if _source_is_animated(src):
+    probe = probe_image(src)
+    if probe.frames > 1:
         raise ValueError("动画图片，已跳过")
 
-    image = load_oriented(src)
+    if options.resize_mode == "long_edge":
+        target_size = fit_size(
+            probe.width,
+            probe.height,
+            options.long_edge,
+            options.long_edge,
+            upscale=False,
+        )
+    elif options.resize_mode == "percent":
+        target_size = (
+            max(1, round(probe.width * options.percent / 100)),
+            max(1, round(probe.height * options.percent / 100)),
+        )
+    else:
+        target_size = None
+
+    max_size = None
+    if target_size is not None and (
+        target_size[0] < probe.width or target_size[1] < probe.height
+    ):
+        max_size = target_size
+
+    image = load_oriented(src, max_size=max_size)
     try:
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled()
 
-        if options.resize_mode == "long_edge":
-            target_size = fit_size(
-                image.width,
-                image.height,
-                options.long_edge,
-                options.long_edge,
-                upscale=False,
-            )
-        elif options.resize_mode == "percent":
-            target_size = (
-                max(1, round(image.width * options.percent / 100)),
-                max(1, round(image.height * options.percent / 100)),
-            )
-        else:
-            target_size = None
-
         if target_size is not None and target_size != image.size:
-            resized = image.resize(target_size, Image.Resampling.LANCZOS)
+            resized = image.resize(
+                target_size,
+                Image.Resampling.LANCZOS,
+                reducing_gap=2.0,
+            )
             image.close()
             image = resized
 
@@ -269,14 +276,14 @@ def convert_image(
                 dst,
                 image_format="JPEG",
                 quality=options.quality,
-                optimize=True,
+                optimize=options.optimize,
             )
         elif fmt == "png":
             save_image_atomic(
                 image,
                 dst,
                 image_format="PNG",
-                optimize=True,
+                optimize=options.optimize,
             )
         else:
             save_image_atomic(
@@ -285,6 +292,7 @@ def convert_image(
                 image_format="WEBP",
                 quality=options.quality,
                 method=4,
+                optimize=options.optimize,
             )
 
         return ConvertResult(
@@ -301,6 +309,7 @@ def convert_image(
 
 
 class BatchImageConvertPage(ToolPage):
+    shutdown_label = "图片转换"
     """批量图片转换工具页。"""
 
     def __init__(self) -> None:
@@ -682,6 +691,8 @@ class BatchImageConvertPage(ToolPage):
             process,
             label_fn=lambda job: job.src.name,
             parent=self,
+            max_workers=MAX_IMAGE_WORKERS,
+            progress_interval_ms=100,
         )
         worker.item_started.connect(self._on_item_started)
         worker.progress_changed.connect(self._on_progress)

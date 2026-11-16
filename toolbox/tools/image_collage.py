@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,18 +33,26 @@ from PyQt6.QtWidgets import (
 from toolbox.common import open_directory
 from toolbox.images import (
     fit_size,
+    image_has_alpha,
     is_animated,
     load_oriented,
-    oriented_size,
+    probe_image,
     save_image_atomic,
     scan_image_files,
 )
 from toolbox.page import ToolPage
 from toolbox.ui import PAGE_MARGINS, add_path_row, make_form
-from toolbox.workers import Cancelled, SingleTaskWorker, shutdown_worker
+from toolbox.workers import (
+    Cancelled,
+    MAX_IMAGE_WORKERS,
+    SingleTaskWorker,
+    shutdown_worker,
+)
 
 MAX_CANVAS_PIXELS = 200_000_000
 MAX_CANVAS_SIDE = 30_000
+# 超大画布本身已占用大量内存，并行解码只会推高内存峰值，强制串行。
+COLLAGE_PARALLEL_PIXEL_LIMIT = 50_000_000
 MAX_WEBP_SIDE = 16_383
 TARGET_WIDTH_MIN, TARGET_WIDTH_MAX = 200, 20_000
 COLUMNS_MIN, COLUMNS_MAX = 1, 12
@@ -97,6 +106,14 @@ class CollageResult:
     skipped: list[tuple[Path, str]]
     width: int
     height: int
+
+
+@dataclass
+class _TileOutcome:
+    """第二遍解码并缩放后的瓦片；``image`` 由消费方负责关闭。"""
+
+    image: Image.Image | None
+    reason: str | None = None
 
 
 # --------------------------------------------------------------------- 纯逻辑
@@ -248,29 +265,48 @@ def compute_grid_layout(
 
 
 def _probe_image(path: Path) -> tuple[tuple[int, int] | None, str | None]:
-    """读取尺寸并检测动画；失败时返回（None, 中文原因）。"""
+    """一次打开文件头读取尺寸并检测动画；失败时返回（None, 中文原因）。"""
     try:
-        width, height = oriented_size(path)
+        probe = probe_image(path)
     except Exception as exc:  # noqa: BLE001 - 单张损坏时继续处理
         return None, f"无法读取：{exc}"
-    try:
-        with Image.open(path) as probe:
-            if getattr(probe, "n_frames", 1) > 1:
-                return None, "动画图片，已跳过"
-    except Exception as exc:  # noqa: BLE001 - 尺寸可读但再次打开失败
-        return None, f"无法读取：{exc}"
-    if width <= 0 or height <= 0:
+    if probe.frames > 1:
+        return None, "动画图片，已跳过"
+    if probe.width <= 0 or probe.height <= 0:
         return None, "图片尺寸无效"
-    return (width, height), None
+    return (probe.width, probe.height), None
 
 
-def _has_alpha(image: Image.Image) -> bool:
-    has_alpha_band = any(
-        band.lower() == "a" for band in image.getbands()
-    )
-    return has_alpha_band or (
-        image.mode == "P" and "transparency" in image.info
-    )
+def _paste_ready(
+    canvas: Image.Image,
+    source: Image.Image,
+    x: int,
+    y: int,
+) -> None:
+    """把已缩放到目标尺寸的图片粘贴到画布，透明区域透出画布背景。
+
+    ``source`` 只读不修改；透明图优先复用 RGBA 源。主线程调用时只读取
+    瓦片，绝不跨线程共享可变的 PIL 图层。
+    """
+    if image_has_alpha(source):
+        rgba = source if source.mode == "RGBA" else source.convert("RGBA")
+        try:
+            alpha = rgba.getchannel("A")
+            try:
+                canvas.paste(rgba, (x, y), alpha)
+            finally:
+                alpha.close()
+        finally:
+            if rgba is not source:
+                rgba.close()
+    elif source.mode == "RGB":
+        canvas.paste(source, (x, y))
+    else:
+        rgb = source.convert("RGB")
+        try:
+            canvas.paste(rgb, (x, y))
+        finally:
+            rgb.close()
 
 
 def _paste_fitted(
@@ -278,33 +314,59 @@ def _paste_fitted(
     image: Image.Image,
     box: tuple[int, int, int, int],
 ) -> None:
-    """把图片缩放到 box 指定尺寸后粘贴，透明区域透出画布背景。"""
+    """把图片缩放到 box 指定尺寸后粘贴，透明区域透出画布背景。
+
+    源图只读不修改：RGB 直接粘贴；透明图优先复用 RGBA 源，缩放时使用
+    ``reducing_gap=2.0`` 降低大图缩小的开销。
+    """
     x, y, width, height = box
     resized: Image.Image | None = None
     source = image
     if image.size != (width, height):
-        resized = image.resize((width, height), Image.Resampling.LANCZOS)
+        resized = image.resize(
+            (width, height),
+            Image.Resampling.LANCZOS,
+            reducing_gap=2.0,
+        )
         source = resized
     try:
-        if _has_alpha(source):
-            rgba = source.convert("RGBA")
-            try:
-                alpha = rgba.getchannel("A")
-                try:
-                    canvas.paste(rgba, (x, y), alpha)
-                finally:
-                    alpha.close()
-            finally:
-                rgba.close()
-        else:
-            rgb = source.convert("RGB")
-            try:
-                canvas.paste(rgb, (x, y))
-            finally:
-                rgb.close()
+        _paste_ready(canvas, source, x, y)
     finally:
         if resized is not None:
             resized.close()
+
+
+def _prepare_tile(
+    path: Path,
+    box: tuple[int, int, int, int],
+    cancel_event: threading.Event | None,
+) -> _TileOutcome:
+    """在工作线程中解码并缩放到目标尺寸，返回可交给主线程粘贴的瓦片。
+
+    返回的 ``image`` 所有权转移给调用方；异常或动画图片会在此关闭图片。
+    """
+    width, height = box[2], box[3]
+    if cancel_event is not None and cancel_event.is_set():
+        raise Cancelled()
+    image = load_oriented(path, max_size=(width, height))
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled()
+        if is_animated(image):
+            image.close()
+            return _TileOutcome(None, "动画图片，已跳过")
+        if image.size != (width, height):
+            resized = image.resize(
+                (width, height),
+                Image.Resampling.LANCZOS,
+                reducing_gap=2.0,
+            )
+            image.close()
+            image = resized
+        return _TileOutcome(image)
+    except BaseException:
+        image.close()
+        raise
 
 
 def _save_format(options: CollageOptions) -> tuple[str, dict[str, object]]:
@@ -381,49 +443,105 @@ def build_collage(
         "RGB", (layout.width, layout.height), options.background
     )
     count = 0
-    try:
-        for index, (path, box) in enumerate(
-            zip(valid_paths, layout.placements)
-        ):
-            if cancel_event is not None and cancel_event.is_set():
-                raise Cancelled(
-                    CollageResult(
-                        output,
-                        count,
-                        skipped,
-                        layout.width,
-                        layout.height,
-                    )
-                )
-            try:
-                image = load_oriented(path)
-                try:
-                    if is_animated(image):
-                        skipped.append((path, "动画图片，已跳过"))
-                    else:
-                        _paste_fitted(canvas, image, box)
-                        count += 1
-                finally:
-                    image.close()
-            except Exception as exc:  # noqa: BLE001 - 单张失败时继续
-                skipped.append((path, f"读取失败：{exc}"))
-            if on_progress is not None:
-                # 读取尺寸与绘制各占一半进度，跳过项不影响最终到达 100%。
-                paste_step = round(
-                    (index + 1) * total_files / len(valid_paths)
-                )
-                on_progress(total_files + paste_step, total_steps)
+    workers = max(1, int(MAX_IMAGE_WORKERS))
+    if layout.width * layout.height > COLLAGE_PARALLEL_PIXEL_LIMIT:
+        workers = 1
+    window = max(1, workers * 2)
+    valid_total = len(valid_paths)
 
-        if count == 0:
-            raise RuntimeError("所有图片都无法读取，未生成拼接图。")
-
-        image_format, save_kwargs = _save_format(options)
-        save_image_atomic(
-            canvas,
-            output,
-            image_format=image_format,
-            **save_kwargs,
+    def cancelled_result() -> Cancelled:
+        return Cancelled(
+            CollageResult(
+                output,
+                count,
+                skipped,
+                layout.width,
+                layout.height,
+            )
         )
+
+    executor = ThreadPoolExecutor(max_workers=workers)
+    pending: dict[int, Future[_TileOutcome]] = {}
+    next_submit = 0
+    try:
+        try:
+            for index, (path, box) in enumerate(
+                zip(valid_paths, layout.placements)
+            ):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise cancelled_result()
+
+                # 预取窗口限制在 workers*2，避免所有原图同时驻留内存。
+                while len(pending) < window and next_submit < valid_total:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise cancelled_result()
+                    pending[next_submit] = executor.submit(
+                        _prepare_tile,
+                        valid_paths[next_submit],
+                        layout.placements[next_submit],
+                        cancel_event,
+                    )
+                    next_submit += 1
+
+                future = pending[index]
+                while not future.done():
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise cancelled_result()
+                    wait((future,), timeout=0.1)
+
+                try:
+                    outcome = future.result()
+                except Cancelled:
+                    pending.pop(index, None)
+                    raise cancelled_result() from None
+                except Exception as exc:  # noqa: BLE001 - 单张失败时继续
+                    pending.pop(index, None)
+                    skipped.append((path, f"读取失败：{exc}"))
+                else:
+                    pending.pop(index, None)
+                    tile = outcome.image
+                    if tile is None:
+                        skipped.append((path, outcome.reason or "无法读取"))
+                    else:
+                        try:
+                            # 主线程按布局顺序只读粘贴，瓦片归主线程关闭。
+                            _paste_ready(canvas, tile, box[0], box[1])
+                            count += 1
+                        except Exception as exc:  # noqa: BLE001 - 单张继续
+                            skipped.append((path, f"读取失败：{exc}"))
+                        finally:
+                            tile.close()
+
+                if on_progress is not None:
+                    # 读取尺寸与绘制各占一半进度，跳过项不影响最终到达 100%。
+                    paste_step = round(
+                        (index + 1) * total_files / valid_total
+                    )
+                    on_progress(total_files + paste_step, total_steps)
+
+            if count == 0:
+                raise RuntimeError("所有图片都无法读取，未生成拼接图。")
+
+            image_format, save_kwargs = _save_format(options)
+            save_image_atomic(
+                canvas,
+                output,
+                image_format=image_format,
+                **save_kwargs,
+            )
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+            # 取消时可能已有完成但尚未粘贴的瓦片，逐个关闭避免泄漏。
+            for future in pending.values():
+                if future.cancelled():
+                    continue
+                try:
+                    outcome = future.result()
+                except BaseException:  # noqa: BLE001 - 失败任务没有瓦片
+                    continue
+                if outcome.image is not None:
+                    outcome.image.close()
+            pending.clear()
     finally:
         canvas.close()
 
@@ -440,6 +558,7 @@ def build_collage(
 
 
 class ImageCollagePage(ToolPage):
+    shutdown_label = "拼接"
     """图片拼接工具页。"""
 
     def __init__(self) -> None:
