@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import sys
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
-
-from toolbox.app import ToolboxWindow
-from toolbox.common import apply_ui_font
-
 
 def main() -> None:
+    # 延迟导入 GUI 依赖：spawn 子进程会导入 __main__，避免无谓的 PyQt6 开销。
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+
+    from toolbox.app import ToolboxWindow
+    from toolbox.common import apply_ui_font
+
     app = QApplication(sys.argv)
     app.setApplicationName("Python 工具箱")
     font_family = apply_ui_font(app)

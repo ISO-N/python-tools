@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
@@ -10,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -156,8 +159,22 @@ class ToolboxWindow(QWidget):
     # ----------------------------------------------------------------- 关闭
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        for page in list(self._pages.values()):
-            if not page.shutdown():
+        # 阶段 1：逐个询问各页面是否取消正在运行的任务。
+        pages = list(self._pages.values())
+        for page in pages:
+            if not page.confirm_shutdown():
+                event.ignore()
+                return
+
+        # 阶段 2：所有页面共享同一个 5 秒截止时间等待后台线程结束。
+        deadline = time.monotonic() + 5.0
+        for page in pages:
+            if not page.wait_shutdown(deadline):
+                QMessageBox.information(
+                    self,
+                    "正在停止",
+                    "后台任务仍在结束中，请稍候再关闭窗口。",
+                )
                 event.ignore()
                 return
         event.accept()
