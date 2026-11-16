@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 import re
 import threading
 from collections.abc import Callable
@@ -30,12 +32,17 @@ from PyQt6.QtWidgets import (
 
 from toolbox.common import human_size, open_directory
 from toolbox.page import ToolPage
+from toolbox.parallel import Chunk, ChunkedCancelled, run_chunked_pool
+from toolbox.pdf_parallel import render_pages_jpeg_chunk
 from toolbox.pdf_utils import open_pdf, save_pdf_atomic
 from toolbox.ui import PAGE_MARGINS, add_path_row, make_form
 from toolbox.workers import Cancelled, SingleTaskWorker, shutdown_worker
 
 DPI_MIN, DPI_MAX = 72, 600
 QUALITY_MIN, QUALITY_MAX = 1, 95
+LOSSY_PARALLEL_MIN_PAGES = 8
+LOSSY_CHUNK_PAGES = 8
+MAX_PARALLEL_WORKERS = 4
 
 _METADATA_KEYS = {
     "author",
@@ -142,6 +149,93 @@ def _preserve_metadata(
         pass
 
 
+def _lossy_worker_count(total: int) -> int:
+    """有损并行渲染的进程数：按 8 页一块估算，最多 4 个。"""
+    chunks = max(1, math.ceil(total / LOSSY_CHUNK_PAGES))
+    return min(
+        MAX_PARALLEL_WORKERS,
+        max(1, os.cpu_count() or 1),
+        chunks,
+    )
+
+
+def _compress_lossy_parallel(
+    document: pymupdf.Document,
+    src: Path,
+    dst: Path,
+    options: CompressionOptions,
+    total: int,
+    before: int,
+    cancel_event: threading.Event | None,
+    on_progress: Callable[[int, int], None] | None,
+) -> int:
+    """并行渲染 JPEG 后由主线程顺序重建 PDF，返回已插入页数。"""
+    groups = [
+        list(range(start, min(start + LOSSY_CHUNK_PAGES, total)))
+        for start in range(0, total, LOSSY_CHUNK_PAGES)
+    ]
+    workers = min(_lossy_worker_count(total), len(groups))
+    chunks = [
+        Chunk(
+            index=index,
+            units=len(group),
+            payload={
+                "pdf_path": str(src),
+                "pages": group,
+                "dpi": int(options.dpi),
+                "quality": int(options.quality),
+            },
+        )
+        for index, group in enumerate(groups)
+    ]
+
+    pages_done = 0
+    new_document = pymupdf.open()
+    try:
+
+        def on_committed(_chunk: Chunk, results: object) -> None:
+            nonlocal pages_done
+            for item in results:  # type: ignore[union-attr]
+                new_page = new_document.new_page(
+                    width=item["width"], height=item["height"]
+                )
+                new_page.insert_image(
+                    new_page.rect, stream=item["jpeg"], alpha=0
+                )
+                pages_done += 1
+                if on_progress is not None:
+                    on_progress(pages_done, total)
+
+        try:
+            run_chunked_pool(
+                chunks,
+                render_pages_jpeg_chunk,
+                cancel_event=cancel_event,
+                on_committed=on_committed,
+                max_workers=workers,
+                # JPEG 字节随结果回传，限制同时在途的块数以控制内存。
+                max_pending=workers,
+            )
+        except ChunkedCancelled:
+            raise Cancelled(
+                CompressionResult(before, 0, pages_done)
+            ) from None
+        except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
+            raise RuntimeError(f"有损压缩失败：{exc}") from exc
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled(
+                CompressionResult(before, 0, pages_done)
+            )
+
+        _preserve_toc(document, new_document, total)
+        _preserve_metadata(document, new_document)
+        save_pdf_atomic(new_document, dst, preset="fast")
+        return pages_done
+    finally:
+        new_document.close()
+
+
 def compress_pdf(
     src: Path,
     dst: Path,
@@ -189,20 +283,54 @@ def compress_pdf(
                 raise Cancelled(CompressionResult(before, 0, 0))
             if on_progress is not None:
                 on_progress(0, total)
-            save_pdf_atomic(
-                document,
-                dst,
-                garbage=4,
-                clean=True,
-                deflate=True,
-                deflate_images=True,
-                deflate_fonts=True,
-            )
+            save_pdf_atomic(document, dst, preset="balanced")
         else:
-            pages_done = 0
-            new_document = pymupdf.open()
-            try:
-                for index in range(total):
+            workers = _lossy_worker_count(total)
+            if total >= LOSSY_PARALLEL_MIN_PAGES and workers > 1:
+                pages_done = _compress_lossy_parallel(
+                    document,
+                    src,
+                    dst,
+                    options,
+                    total,
+                    before,
+                    cancel_event,
+                    on_progress,
+                )
+            else:
+                pages_done = 0
+                new_document = pymupdf.open()
+                try:
+                    for index in range(total):
+                        if (
+                            cancel_event is not None
+                            and cancel_event.is_set()
+                        ):
+                            raise Cancelled(
+                                CompressionResult(
+                                    before, 0, pages_done
+                                )
+                            )
+                        page = document.load_page(index)
+                        pixmap = page.get_pixmap(
+                            dpi=options.dpi,
+                            colorspace=pymupdf.csRGB,
+                            alpha=False,
+                        )
+                        jpeg = pixmap.tobytes(
+                            "jpeg", jpg_quality=options.quality
+                        )
+                        new_page = new_document.new_page(
+                            width=page.rect.width,
+                            height=page.rect.height,
+                        )
+                        new_page.insert_image(
+                            page.rect, stream=jpeg, alpha=0
+                        )
+                        pages_done += 1
+                        if on_progress is not None:
+                            on_progress(pages_done, total)
+
                     if (
                         cancel_event is not None
                         and cancel_event.is_set()
@@ -210,32 +338,11 @@ def compress_pdf(
                         raise Cancelled(
                             CompressionResult(before, 0, pages_done)
                         )
-                    page = document.load_page(index)
-                    pixmap = page.get_pixmap(
-                        dpi=options.dpi,
-                        colorspace=pymupdf.csRGB,
-                        alpha=False,
-                    )
-                    jpeg = pixmap.tobytes(
-                        "jpeg", jpg_quality=options.quality
-                    )
-                    new_page = new_document.new_page(
-                        width=page.rect.width, height=page.rect.height
-                    )
-                    new_page.insert_image(page.rect, stream=jpeg)
-                    pages_done += 1
-                    if on_progress is not None:
-                        on_progress(pages_done, total)
-
-                if cancel_event is not None and cancel_event.is_set():
-                    raise Cancelled(
-                        CompressionResult(before, 0, pages_done)
-                    )
-                _preserve_toc(document, new_document, total)
-                _preserve_metadata(document, new_document)
-                save_pdf_atomic(new_document, dst)
-            finally:
-                new_document.close()
+                    _preserve_toc(document, new_document, total)
+                    _preserve_metadata(document, new_document)
+                    save_pdf_atomic(new_document, dst, preset="fast")
+                finally:
+                    new_document.close()
 
         after = dst.stat().st_size
     finally:
@@ -251,6 +358,11 @@ def compress_pdf(
 
 class PdfCompressPage(ToolPage):
     """PDF 压缩工具页。"""
+
+    shutdown_label = "压缩"
+
+    def current_worker(self) -> SingleTaskWorker | None:
+        return self._worker
 
     def __init__(self) -> None:
         super().__init__()

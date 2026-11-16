@@ -48,10 +48,13 @@ from toolbox.chapters import BOOKMARK_AI_PROMPT, ConfigError, parse_chapter_conf
 from toolbox.common import find_cjk_font_file, open_directory
 from toolbox.page import ToolPage
 from toolbox.pdf_utils import (
+    PageNumberTemplate,
+    TextStamp,
+    add_text_stamps,
     format_page_number,
-    insert_rotated_text,
-    load_pdf_font,
+    load_pdf_font_resource,
     open_pdf,
+    parse_page_number_template,
     register_cjk_font,
     save_pdf_atomic,
 )
@@ -121,10 +124,17 @@ class PageToolsResult:
 
 
 def _validate_page_number_options(
-    options: PageNumberOptions, total_pages: int
+    options: PageNumberOptions,
+    total_pages: int,
+    template: PageNumberTemplate | None = None,
 ) -> None:
-    """校验页码参数；模板本身交给 ``format_page_number`` 检查。"""
-    format_page_number(options.template, options.start_number, total_pages)
+    """校验页码参数；模板可传入已解析结果以避免重复解析。"""
+    parsed = (
+        template
+        if template is not None
+        else parse_page_number_template(options.template)
+    )
+    parsed.render(options.start_number, total_pages)
     if options.start_number < 1:
         raise ValueError("起始编号必须大于等于 1")
     if options.first_page < 1:
@@ -143,9 +153,15 @@ def _page_number_layout(
     page_number: int,
     total: int,
     font: pymupdf.Font,
+    template: PageNumberTemplate | None = None,
 ) -> tuple[str, tuple[float, float]]:
     """计算某一页的页码文本与绘制中心，同时校验文本是否过宽。"""
-    text = format_page_number(options.template, page_number, total)
+    parsed = (
+        template
+        if template is not None
+        else parse_page_number_template(options.template)
+    )
+    text = parsed.render(page_number, total)
     margin = options.margin_mm * MM_TO_PT
     width = font.text_length(text, fontsize=options.font_size)
     drawable_width = page.rect.width - 2 * margin
@@ -180,28 +196,35 @@ def apply_page_numbers(
     每页绘制前都会尝试嵌入 ``font_path`` 字体，失败时回退内置 ``china-s``。
     """
     total = doc.page_count
-    _validate_page_number_options(options, total)
+    template = parse_page_number_template(options.template)
+    _validate_page_number_options(options, total, template)
     if options.first_page > total:
         return 0
 
-    font = load_pdf_font(font_path)
+    resource = load_pdf_font_resource(font_path)
+    font = resource.font
     drawn = 0
     for index in range(options.first_page - 1, total):
         page = doc.load_page(index)
         page_number = options.start_number + index - (options.first_page - 1)
         text, center = _page_number_layout(
-            page, options, page_number, total, font
+            page, options, page_number, total, font, template
         )
-        fontname = register_cjk_font(page, font_path)
-        insert_rotated_text(
+        fontname = register_cjk_font(
+            page, font_path, resource=resource
+        )
+        add_text_stamps(
             page,
-            center,
-            text,
+            [
+                TextStamp(
+                    center,
+                    text,
+                    options.font_size,
+                    color=options.color,
+                )
+            ],
             fontname=fontname,
             font=font,
-            fontsize=options.font_size,
-            color=options.color,
-            angle=0.0,
         )
         drawn += 1
     return drawn
@@ -313,24 +336,28 @@ def apply_watermark(
 ) -> int:
     """为每一页绘制水印，返回绘制页数。"""
     _validate_watermark_options(options)
-    font = load_pdf_font(font_path)
+    resource = load_pdf_font_resource(font_path)
+    font = resource.font
     text_width = font.text_length(options.text, fontsize=options.font_size)
     drawn = 0
     for index in range(doc.page_count):
         page = doc.load_page(index)
-        fontname = register_cjk_font(page, font_path)
-        for center in _watermark_centers(page, options, text_width):
-            insert_rotated_text(
-                page,
+        fontname = register_cjk_font(
+            page, font_path, resource=resource
+        )
+        stamps = [
+            TextStamp(
                 center,
                 options.text,
-                fontname=fontname,
-                font=font,
-                fontsize=options.font_size,
+                options.font_size,
                 color=options.color,
                 fill_opacity=options.opacity,
                 angle=options.angle,
+                text_width=text_width,
             )
+            for center in _watermark_centers(page, options, text_width)
+        ]
+        add_text_stamps(page, stamps, fontname=fontname, font=font)
         drawn += 1
     return drawn
 
@@ -402,8 +429,14 @@ def process_pdf(
             report_progress()
 
         # 先做全部参数校验，避免处理到一半才发现配置错误。
+        page_number_template: PageNumberTemplate | None = None
         if has_page_numbers:
-            _validate_page_number_options(page_number_options, total_pages)
+            page_number_template = parse_page_number_template(
+                page_number_options.template
+            )
+            _validate_page_number_options(
+                page_number_options, total_pages, page_number_template
+            )
         if has_watermark:
             _validate_watermark_options(watermark_options)
         toc_entries: list[list] = []
@@ -419,10 +452,19 @@ def process_pdf(
                     "未执行书签操作"
                 )
 
-        font = (
-            load_pdf_font(font_path)
+        font_resource = (
+            load_pdf_font_resource(font_path)
             if has_page_numbers or has_watermark
             else None
+        )
+        font = font_resource.font if font_resource is not None else None
+        watermark_text_width = (
+            font.text_length(
+                watermark_options.text,
+                fontsize=watermark_options.font_size,
+            )
+            if has_watermark
+            else 0.0
         )
         report_progress()
 
@@ -434,10 +476,13 @@ def process_pdf(
             )
             fontname: str | None = None
             if draw_page_number or has_watermark:
-                fontname = register_cjk_font(page, font_path)
+                fontname = register_cjk_font(
+                    page, font_path, resource=font_resource
+                )
                 if fontname != "china-s":
                     font_embedded = True
 
+            stamps: list[TextStamp] = []
             if has_page_numbers:
                 if draw_page_number:
                     page_number = (
@@ -451,41 +496,45 @@ def process_pdf(
                         page_number,
                         total_pages,
                         font,
+                        page_number_template,
                     )
-                    insert_rotated_text(
-                        page,
-                        center,
-                        text,
-                        fontname=fontname,
-                        font=font,
-                        fontsize=page_number_options.font_size,
-                        color=page_number_options.color,
-                        angle=0.0,
+                    stamps.append(
+                        TextStamp(
+                            center,
+                            text,
+                            page_number_options.font_size,
+                            color=page_number_options.color,
+                        )
                     )
                     page_numbers_drawn += 1
+
+            if has_watermark:
+                for center in _watermark_centers(
+                    page, watermark_options, watermark_text_width
+                ):
+                    stamps.append(
+                        TextStamp(
+                            center,
+                            watermark_options.text,
+                            watermark_options.font_size,
+                            color=watermark_options.color,
+                            fill_opacity=watermark_options.opacity,
+                            angle=watermark_options.angle,
+                            text_width=watermark_text_width,
+                        )
+                    )
+                watermark_pages += 1
+
+            if stamps and fontname is not None and font is not None:
+                add_text_stamps(
+                    page, stamps, fontname=fontname, font=font
+                )
+
+            if has_page_numbers:
                 advance()
                 check_cancelled()
 
             if has_watermark:
-                text_width = font.text_length(
-                    watermark_options.text,
-                    fontsize=watermark_options.font_size,
-                )
-                for center in _watermark_centers(
-                    page, watermark_options, text_width
-                ):
-                    insert_rotated_text(
-                        page,
-                        center,
-                        watermark_options.text,
-                        fontname=fontname,
-                        font=font,
-                        fontsize=watermark_options.font_size,
-                        color=watermark_options.color,
-                        fill_opacity=watermark_options.opacity,
-                        angle=watermark_options.angle,
-                    )
-                watermark_pages += 1
                 advance()
                 check_cancelled()
 
@@ -496,11 +545,16 @@ def process_pdf(
             advance()
 
         check_cancelled()
-        try:
-            document.subset_fonts()
-        except Exception:  # noqa: BLE001 - 字体子集化失败不影响保存
-            pass
-        save_pdf_atomic(document, dst_path)
+        if (
+            font_embedded
+            and font_resource is not None
+            and font_resource.file_backed
+        ):
+            try:
+                document.subset_fonts()
+            except Exception:  # noqa: BLE001 - 字体子集化失败不影响保存
+                pass
+        save_pdf_atomic(document, dst_path, preset="balanced")
     finally:
         document.close()
 
@@ -518,7 +572,41 @@ def process_pdf(
 # --------------------------------------------------------------------- 界面部分
 
 
+# 浏览与开始处理会重复读取同一个源 PDF；按（路径, mtime, 大小）缓存结果，
+# 文件改动或换路径后键自然失效。
+_SOURCE_INFO_CACHE: dict[
+    tuple[str, int, int], tuple[int, list[list] | None]
+] = {}
+_SOURCE_INFO_CACHE_LIMIT = 16
+
+
+def _source_info(
+    path: Path, *, with_toc: bool = False
+) -> tuple[int, list[list] | None]:
+    """返回缓存中的页数与书签；``with_toc`` 为假时不读取目录。"""
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    cached = _SOURCE_INFO_CACHE.get(key)
+    if cached is not None and (not with_toc or cached[1] is not None):
+        return cached
+
+    document = open_pdf(path)
+    try:
+        page_count = document.page_count
+        toc = document.get_toc() if with_toc else None
+    finally:
+        document.close()
+
+    if toc is None and cached is not None:
+        toc = cached[1]
+    if len(_SOURCE_INFO_CACHE) >= _SOURCE_INFO_CACHE_LIMIT:
+        _SOURCE_INFO_CACHE.clear()
+    _SOURCE_INFO_CACHE[key] = (page_count, toc)
+    return page_count, toc
+
+
 class PdfPageToolsPage(ToolPage):
+    shutdown_label = "PDF 处理"
     """PDF 页码 / 目录书签 / 文字水印工具页。"""
 
     def __init__(self) -> None:
@@ -977,11 +1065,7 @@ class PdfPageToolsPage(ToolPage):
 
     def _load_source_page_count(self, path: Path) -> bool:
         try:
-            document = open_pdf(path)
-            try:
-                page_count = document.page_count
-            finally:
-                document.close()
+            page_count, _toc = _source_info(path)
         except Exception as exc:  # noqa: BLE001 - 统一提示读取失败
             self._page_count = None
             self.first_page_spin.setRange(1, 99999)
@@ -1134,14 +1218,10 @@ class PdfPageToolsPage(ToolPage):
             )
 
         try:
-            document = open_pdf(source)
-            try:
-                page_count = document.page_count
-                existing_toc = (
-                    document.get_toc() if bookmark_config is not None else []
-                )
-            finally:
-                document.close()
+            page_count, toc = _source_info(
+                source, with_toc=bookmark_config is not None
+            )
+            existing_toc = toc or []
         except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
             QMessageBox.critical(self, "无法打开 PDF", str(exc))
             return None

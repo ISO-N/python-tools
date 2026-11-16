@@ -6,13 +6,15 @@
 
 from __future__ import annotations
 
+import math
 import os
 import threading
+import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pymupdf
-from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
     QGridLayout,
@@ -29,18 +31,28 @@ from PyQt6.QtWidgets import (
 )
 
 from toolbox.common import open_directory
+from toolbox.errors import Cancelled
 from toolbox.page import ToolPage
+from toolbox.parallel import Chunk, ChunkedCancelled, run_chunked_pool
+from toolbox.pdf_parallel import render_pages_chunk
+from toolbox.pdf_utils import open_pdf
+from toolbox.workers import SingleTaskWorker, shutdown_worker
 
 DPI_MIN, DPI_MAX = 72, 600
 JPEG_QUALITY = 90
+MAX_CHUNK_BYTES = 128 * 1024 * 1024
+MAX_CHUNK_PAGES = 16
+MAX_PARALLEL_WORKERS = 4
+# 进程池启动成本约 0.2s；小任务（低 DPI / 页数少）串行更快。
+MIN_PARALLEL_BYTES = 64 * 1024 * 1024
 
 
-class ConversionCancelled(Exception):
-    """用户取消转换时抛出，携带已成功生成的图片数量。"""
+@dataclass(frozen=True)
+class RenderResult:
+    """取消或完成时携带的输出目录与已生成数量。"""
 
-    def __init__(self, done: int) -> None:
-        super().__init__("转换已取消")
-        self.done = done
+    out_dir: Path
+    done: int
 
 
 def parse_page_range(text: str, total_pages: int) -> list[int]:
@@ -96,6 +108,22 @@ def output_dir_for(pdf_path: Path, output_root: Path) -> Path:
     return Path(output_root) / Path(pdf_path).stem
 
 
+def _temp_image_path(
+    out_dir: Path, tmp_prefix: str, final_name: str
+) -> Path:
+    """与进程池约定一致的临时文件名。"""
+    return out_dir / f".{tmp_prefix}_{final_name}.tmp"
+
+
+def _remove_temp_files(out_dir: Path, tmp_prefix: str) -> None:
+    """删除本任务遗留的临时图片；最终文件不受影响。"""
+    for path in out_dir.glob(f".{tmp_prefix}_*.tmp"):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def convert_pdf(
     pdf_path: Path,
     out_dir: Path,
@@ -108,7 +136,9 @@ def convert_pdf(
     """把 PDF 的指定页面渲染成图片，返回（输出目录, 生成数量）。
 
     ``pages`` 为 0 基页码；``on_progress`` 在每页完成后回调（已完成数, 总数）；
-    ``cancel_event`` 被置位时在两页之间停止，并抛出 ``ConversionCancelled``。
+    ``cancel_event`` 被置位时在两页之间停止，并抛出
+    ``Cancelled(RenderResult(out_dir, done))``。每页先写临时文件，成功后
+    再原子替换为最终文件。
     """
     pdf_path = Path(pdf_path)
     out_dir = Path(out_dir)
@@ -119,6 +149,7 @@ def convert_pdf(
     stem = pdf_path.stem
     total = len(pages)
     done = 0
+    tmp_prefix = uuid.uuid4().hex
 
     try:
         doc = pymupdf.open(pdf_path)
@@ -136,18 +167,30 @@ def convert_pdf(
         out_dir.mkdir(parents=True, exist_ok=True)
         for index in pages:
             if cancel_event is not None and cancel_event.is_set():
-                raise ConversionCancelled(done)
+                raise Cancelled(RenderResult(out_dir, done))
 
             page = doc.load_page(index)
             pixmap = page.get_pixmap(dpi=dpi, alpha=False)
             output_path = out_dir / f"{stem}_page_{index + 1:03d}.{ext}"
+            temp_path = _temp_image_path(
+                out_dir, tmp_prefix, output_path.name
+            )
             try:
+                # 临时文件以 .tmp 结尾，必须显式指定输出格式。
                 if ext == "jpg":
-                    pixmap.save(str(output_path), jpg_quality=JPEG_QUALITY)
+                    pixmap.save(
+                        str(temp_path),
+                        output="jpeg",
+                        jpg_quality=JPEG_QUALITY,
+                    )
                 else:
-                    pixmap.save(str(output_path))
+                    pixmap.save(str(temp_path), output="png")
+                os.replace(temp_path, output_path)
             except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
-                raise RuntimeError(f"保存图片失败：{output_path}\n{exc}") from exc
+                temp_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"保存图片失败：{output_path}\n{exc}"
+                ) from exc
 
             done += 1
             if on_progress is not None:
@@ -158,58 +201,198 @@ def convert_pdf(
     return out_dir, done
 
 
-class ConversionThread(QThread):
-    """在后台线程中执行 PDF 转图片，通过信号向界面报告状态。"""
+def _estimate_pixmap_bytes(width: float, height: float, dpi: int) -> int:
+    """按 RGB 三通道估算一页 pixmap 的字节数。"""
+    return (
+        math.ceil(width * dpi / 72) * math.ceil(height * dpi / 72) * 3
+    )
 
-    progress_changed = pyqtSignal(int, int)
-    conversion_done = pyqtSignal(str, int)
-    conversion_cancelled = pyqtSignal(int)
-    conversion_failed = pyqtSignal(str)
 
-    def __init__(
-        self,
-        pdf_path: Path,
-        out_dir: Path,
-        image_format: str,
-        dpi: int,
-        pages: list[int],
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._pdf_path = pdf_path
-        self._out_dir = out_dir
-        self._image_format = image_format
-        self._dpi = dpi
-        self._pages = pages
-        self._cancel_event = threading.Event()
+def _split_pages_into_chunks(
+    page_bytes: dict[int, int],
+    pages: Sequence[int],
+    *,
+    max_pages: int,
+) -> list[list[int]]:
+    """按预估字节数与页数上限贪心切分，保持页面顺序。"""
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_bytes = 0
+    for index in pages:
+        size = page_bytes[index]
+        if current and (
+            current_bytes + size > MAX_CHUNK_BYTES
+            or len(current) >= max_pages
+        ):
+            groups.append(current)
+            current = []
+            current_bytes = 0
+        current.append(index)
+        current_bytes += size
+    if current:
+        groups.append(current)
+    return groups
 
-    def cancel(self) -> None:
-        self._cancel_event.set()
 
-    def run(self) -> None:
-        try:
-            final_dir, count = convert_pdf(
-                self._pdf_path,
-                self._out_dir,
-                self._image_format,
-                self._dpi,
-                self._pages,
-                on_progress=lambda done, total: self.progress_changed.emit(done, total),
-                cancel_event=self._cancel_event,
+def convert_pdf_parallel(
+    pdf_path: Path,
+    out_dir: Path,
+    image_format: str,
+    dpi: int,
+    pages: Sequence[int],
+    *,
+    cancel_event: threading.Event | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    max_workers: int | None = None,
+) -> tuple[Path, int]:
+    """多进程渲染 PDF 页面；输出文件名与串行路径完全一致。
+
+    父进程只打开 PDF 读取页数与页面尺寸，渲染在 ``spawn`` 子进程中完成；
+    子进程写临时文件，父进程按块顺序原子改名为最终文件。取消时只保留
+    连续完成块的前缀图片，并抛出 ``Cancelled(RenderResult(out_dir, done))``。
+    """
+    pdf_path = Path(pdf_path)
+    out_dir = Path(out_dir)
+    fmt = image_format.lower()
+    if fmt not in {"png", "jpeg", "jpg"}:
+        raise ValueError(f"不支持的图片格式：{image_format}")
+    ext = "jpg" if fmt in {"jpeg", "jpg"} else "png"
+    page_list = list(pages)
+    total = len(page_list)
+
+    document = open_pdf(pdf_path)
+    try:
+        if any(
+            index < 0 or index >= document.page_count
+            for index in page_list
+        ):
+            raise ValueError(
+                f"页码超出 PDF 页数范围（共 {document.page_count} 页）"
             )
-            self.conversion_done.emit(str(final_dir), count)
-        except ConversionCancelled as exc:
-            self.conversion_cancelled.emit(exc.done)
-        except Exception as exc:  # noqa: BLE001 - 子线程异常统一回传界面
-            self.conversion_failed.emit(str(exc))
+        page_bytes: dict[int, int] = {}
+        for index in page_list:
+            rect = document.load_page(index).rect
+            page_bytes[index] = _estimate_pixmap_bytes(
+                rect.width, rect.height, dpi
+            )
+    finally:
+        document.close()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cpu_count = max(1, os.cpu_count() or 1)
+    worker_limit = min(MAX_PARALLEL_WORKERS, cpu_count)
+    if max_workers is not None:
+        worker_limit = min(
+            worker_limit, max(1, int(max_workers))
+        )
+
+    total_bytes = sum(page_bytes.values())
+    if (
+        total <= 4
+        or worker_limit <= 1
+        or total_bytes < MIN_PARALLEL_BYTES
+    ):
+        return convert_pdf(
+            pdf_path,
+            out_dir,
+            image_format,
+            dpi,
+            page_list,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+        )
+
+    # 在内存上限内继续按页数均衡切分，让小 PDF 也能用上多个进程。
+    page_cap = min(
+        MAX_CHUNK_PAGES,
+        max(1, math.ceil(total / worker_limit)),
+    )
+    page_groups = _split_pages_into_chunks(
+        page_bytes, page_list, max_pages=page_cap
+    )
+    workers = min(worker_limit, len(page_groups))
+    if workers <= 1:
+        return convert_pdf(
+            pdf_path,
+            out_dir,
+            image_format,
+            dpi,
+            page_list,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+        )
+
+    tmp_prefix = uuid.uuid4().hex
+    child_format = "jpeg" if ext == "jpg" else "png"
+    chunks = [
+        Chunk(
+            index=i,
+            units=len(group),
+            payload={
+                "pdf_path": str(pdf_path),
+                "pages": group,
+                "out_dir": str(out_dir),
+                "stem": pdf_path.stem,
+                "image_format": child_format,
+                "dpi": int(dpi),
+                "quality": JPEG_QUALITY,
+                "tmp_prefix": tmp_prefix,
+            },
+        )
+        for i, group in enumerate(page_groups)
+    ]
+
+    done = 0
+
+    def on_committed(_chunk: Chunk, results: object) -> None:
+        nonlocal done
+        for item in results:  # type: ignore[union-attr]
+            temp_path = Path(item["temp"])
+            final_path = Path(item["final"])
+            try:
+                os.replace(temp_path, final_path)
+            except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
+                raise RuntimeError(
+                    f"保存图片失败：{final_path}\n{exc}"
+                ) from exc
+            done += 1
+            if on_progress is not None:
+                on_progress(done, total)
+
+    try:
+        run_chunked_pool(
+            chunks,
+            render_pages_chunk,
+            cancel_event=cancel_event,
+            on_committed=on_committed,
+            max_workers=workers,
+        )
+    except ChunkedCancelled:
+        _remove_temp_files(out_dir, tmp_prefix)
+        raise Cancelled(RenderResult(out_dir, done)) from None
+    except Exception as exc:  # noqa: BLE001 - 统一转换为中文提示
+        _remove_temp_files(out_dir, tmp_prefix)
+        if isinstance(exc, RuntimeError) and str(exc).startswith(
+            "保存图片失败"
+        ):
+            raise
+        raise RuntimeError(f"转换失败：{exc}") from exc
+
+    return out_dir, done
 
 
 class PdfToImagesPage(ToolPage):
     """PDF 转图片工具页。"""
 
+    shutdown_label = "转换"
+
+    def current_worker(self) -> SingleTaskWorker | None:
+        return self._worker
+
     def __init__(self) -> None:
         super().__init__()
-        self._thread: ConversionThread | None = None
+        self._worker: SingleTaskWorker | None = None
         self._last_output_dir: Path | None = None
         self._build_ui()
         self._update_subdir_hint()
@@ -407,7 +590,7 @@ class PdfToImagesPage(ToolPage):
         return pdf_path, output_root, image_format, self.dpi_spin.value(), pages
 
     def _start_conversion(self) -> None:
-        if self._thread is not None and self._thread.isRunning():
+        if self._worker is not None and self._worker.isRunning():
             return
         options = self._collect_options()
         if options is None:
@@ -433,31 +616,59 @@ class PdfToImagesPage(ToolPage):
         self.progress_bar.setValue(0)
         self._set_status(f"正在转换 {len(pages)} 页…")
 
-        thread = ConversionThread(
-            pdf_path, out_dir, image_format, dpi, list(pages), self
+        def task(
+            on_progress: Callable[[object, object], None],
+            cancel_event: threading.Event,
+        ) -> RenderResult:
+            final_dir, count = convert_pdf_parallel(
+                pdf_path,
+                out_dir,
+                image_format,
+                dpi,
+                list(pages),
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+            )
+            return RenderResult(final_dir, count)
+
+        worker = SingleTaskWorker(task, self)
+        worker.progress_changed.connect(self._on_progress)
+        worker.task_finished.connect(self._on_done)
+        worker.task_cancelled.connect(self._on_cancelled)
+        worker.task_failed.connect(self._on_failed)
+        worker.finished.connect(self._on_worker_finished)
+        self._worker = worker
+        worker.start()
+
+    def _on_progress(self, done: object, total: object) -> None:
+        done_count = int(done)
+        total_count = int(total)
+        percent = (
+            int(done_count / total_count * 100) if total_count else 0
         )
-        thread.progress_changed.connect(self._on_progress)
-        thread.conversion_done.connect(self._on_done)
-        thread.conversion_cancelled.connect(self._on_cancelled)
-        thread.conversion_failed.connect(self._on_failed)
-        thread.finished.connect(self._on_thread_finished)
-        self._thread = thread
-        thread.start()
-
-    def _on_progress(self, done: int, total: int) -> None:
-        percent = int(done / total * 100) if total else 0
         self.progress_bar.setValue(percent)
-        self._set_status(f"正在处理第 {done}/{total} 页…")
+        self._set_status(
+            f"正在处理第 {done_count}/{total_count} 页…"
+        )
 
-    def _on_done(self, out_dir: str, count: int) -> None:
+    def _on_done(self, result: object) -> None:
+        if not isinstance(result, RenderResult):
+            self._on_failed("任务返回了无法识别的结果。")
+            return
+        self._last_output_dir = result.out_dir
         self.progress_bar.setValue(100)
-        self._set_status(f"完成：已生成 {count} 张图片 → {out_dir}")
+        self._set_status(
+            f"完成：已生成 {result.done} 张图片 → {result.out_dir}"
+        )
         self.open_btn.setEnabled(True)
         QMessageBox.information(
-            self, "转换完成", f"已生成 {count} 张图片：\n{out_dir}"
+            self,
+            "转换完成",
+            f"已生成 {result.done} 张图片：\n{result.out_dir}",
         )
 
-    def _on_cancelled(self, done: int) -> None:
+    def _on_cancelled(self, result: object) -> None:
+        done = result.done if isinstance(result, RenderResult) else 0
         self._set_status(f"已取消，已生成 {done} 张图片")
         if done:
             self.open_btn.setEnabled(True)
@@ -466,18 +677,18 @@ class PdfToImagesPage(ToolPage):
         self._set_status("转换失败")
         QMessageBox.critical(self, "转换失败", message)
 
-    def _on_thread_finished(self) -> None:
-        thread = self._thread
-        self._thread = None
-        if thread is not None:
-            thread.deleteLater()
+    def _on_worker_finished(self) -> None:
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            worker.deleteLater()
         self.start_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
 
     def _cancel_conversion(self) -> None:
-        if self._thread is None or not self._thread.isRunning():
+        if self._worker is None or not self._worker.isRunning():
             return
-        self._thread.cancel()
+        self._worker.cancel()
         self.cancel_btn.setEnabled(False)
         self._set_status("正在取消…")
 
@@ -502,22 +713,4 @@ class PdfToImagesPage(ToolPage):
 
     def shutdown(self) -> bool:
         """主窗口关闭前调用；转换进行中时确认并等待线程结束。"""
-        if self._thread is not None and self._thread.isRunning():
-            reply = QMessageBox.question(
-                self.window(),
-                "退出",
-                "转换正在进行，确定要退出吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return False
-            self._thread.cancel()
-            if not self._thread.wait(5000):
-                QMessageBox.information(
-                    self.window(),
-                    "正在停止",
-                    "当前页面仍在渲染，请稍候再关闭窗口。",
-                )
-                return False
-        return True
+        return shutdown_worker(self._worker, self, "转换")

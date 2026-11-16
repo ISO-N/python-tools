@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import bisect
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from toolbox.common import open_directory, unique_path
+from toolbox.common import UniquePathAllocator, open_directory
 from toolbox.page import ToolPage
 from toolbox.pdf_utils import PdfError, open_pdf, save_pdf_atomic
 from toolbox.ui import add_path_row, make_form
@@ -112,6 +113,8 @@ def parse_range_groups(text: str, total_pages: int) -> list[SplitChunk]:
         raise ValueError("拆分范围不能为空")
 
     chunks: list[SplitChunk] = []
+    # 已接受区间按 start 排序且互不重叠；只需检查前驱与后继即可判定重叠。
+    accepted: list[tuple[int, int]] = []
     for token in normalized.split(","):
         if not token:
             continue
@@ -132,9 +135,13 @@ def parse_range_groups(text: str, total_pages: int) -> list[SplitChunk]:
             raise ValueError(f"页码范围起点大于终点：{token}")
         if start < 1 or end > total_pages:
             raise ValueError(f"页码超出范围（1-{total_pages}）：{token}")
-        for previous in chunks:
-            if start <= previous.end and end >= previous.start:
-                raise ValueError(f"页码范围重叠：{token}")
+
+        position = bisect.bisect_left(accepted, (start,))
+        if position and accepted[position - 1][1] >= start:
+            raise ValueError(f"页码范围重叠：{token}")
+        if position < len(accepted) and accepted[position][0] <= end:
+            raise ValueError(f"页码范围重叠：{token}")
+        accepted.insert(position, (start, end))
         chunks.append(SplitChunk(start, end))
 
     if not chunks:
@@ -235,9 +242,10 @@ def merge_pdfs(
 ) -> MergeResult:
     """按顺序合并多个 PDF。
 
-    合并前对所有输入做全量预检，任何文件不可用时抛出 :class:`PdfError`
-    （消息中列出文件名），且不会产生输出。``on_progress`` 以
-    ``(已处理文件数, 文件总数)`` 报告进度。
+    合并分两遍：第一遍逐文件打开、记录页数并收集全部错误；任一文件不可用
+    时抛出 :class:`PdfError`（消息中列出文件名），且不会产生输出。第二遍
+    逐个重新打开并按顺序插入，最后原子保存。``on_progress`` 以
+    ``(已处理文件数, 文件总数)`` 报告进度，取消在文件之间检查。
     """
     path_list = [Path(path) for path in paths]
     output = Path(output)
@@ -252,49 +260,59 @@ def merge_pdfs(
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
 
-    opened: list[tuple[Path, pymupdf.Document]] = []
+    # 第一遍：只校验并记录页数，不在内存中保留 Document。
+    validated: list[tuple[Path, int]] = []
     errors: list[str] = []
-    try:
-        for path in path_list:
-            if cancel_event is not None and cancel_event.is_set():
-                raise Cancelled()
-            if not path.is_file():
-                errors.append(f"{path.name}：文件不存在")
-                continue
-            try:
-                opened.append((path, open_pdf(path)))
-            except Exception as exc:  # noqa: BLE001 - 汇总后统一转中文提示
-                errors.append(f"{path.name}：{exc}")
-
-        if errors:
-            raise PdfError("以下 PDF 文件无法处理：\n" + "\n".join(errors))
+    for path in path_list:
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled()
-
-        document = pymupdf.open()
-        done_pages = 0
+        if not path.is_file():
+            errors.append(f"{path.name}：文件不存在")
+            continue
         try:
-            for index, (_path, source) in enumerate(opened):
-                if cancel_event is not None and cancel_event.is_set():
-                    raise Cancelled()
+            source = open_pdf(path)
+            try:
+                page_count = source.page_count
+            finally:
+                source.close()
+        except Exception as exc:  # noqa: BLE001 - 汇总后统一转中文提示
+            errors.append(f"{path.name}：{exc}")
+        else:
+            validated.append((path, page_count))
+
+    if errors:
+        raise PdfError("以下 PDF 文件无法处理：\n" + "\n".join(errors))
+    if cancel_event is not None and cancel_event.is_set():
+        raise Cancelled()
+
+    # 第二遍：逐个重新打开并插入，插入后立即关闭以限制打开文件数。
+    document = pymupdf.open()
+    done_pages = 0
+    try:
+        for index, (path, page_count) in enumerate(validated):
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled()
+            source = open_pdf(path)
+            try:
                 document.insert_pdf(
                     source,
                     from_page=0,
-                    to_page=source.page_count - 1,
+                    to_page=page_count - 1,
                     links=True,
                     annots=True,
                 )
-                done_pages += source.page_count
-                if on_progress is not None:
-                    on_progress(index + 1, len(opened))
-            save_pdf_atomic(document, output)
-        finally:
-            document.close()
+            finally:
+                source.close()
+            done_pages += page_count
+            if on_progress is not None:
+                on_progress(index + 1, len(validated))
+        save_pdf_atomic(document, output)
     finally:
-        for _path, source in opened:
-            source.close()
+        document.close()
 
-    return MergeResult(output=output, files=len(opened), pages=done_pages)
+    return MergeResult(
+        output=output, files=len(validated), pages=done_pages
+    )
 
 
 def split_pdf(
@@ -308,8 +326,9 @@ def split_pdf(
 ) -> SplitResult:
     """按块拆分 PDF，每个块生成一个 PDF 文件。
 
-    ``overwrite`` 为假时，同名目标文件通过 :func:`unique_path` 自动改名；
-    为真时原子覆盖。取消时抛出 ``Cancelled``，其 ``result`` 为已完成部分
+    ``overwrite`` 为假时，同名目标文件通过
+    :class:`~toolbox.common.UniquePathAllocator` 自动改名；为真时原子覆盖。
+    取消时抛出 ``Cancelled``，其 ``result`` 为已完成部分
     的 :class:`SplitResult`，已经生成的文件保留。``on_progress`` 以
     ``(已处理页数, 待处理页数)`` 报告进度。
     """
@@ -322,6 +341,8 @@ def split_pdf(
         raise Cancelled(SplitResult(files=0, pages=0, skipped=0))
 
     source = open_pdf(src)
+    src_resolved = src.resolve()
+    out_dir_resolved = out_dir.resolve()
     done_files = 0
     done_pages = 0
     skipped = 0
@@ -347,6 +368,8 @@ def split_pdf(
         except OSError as exc:
             raise PdfError(f"无法创建输出目录：{out_dir}\n{exc}") from exc
 
+        allocator = UniquePathAllocator(reserve_planned=True)
+        src_in_out_dir = src_resolved.parent == out_dir_resolved
         total_chunk_pages = sum(
             chunk.end - chunk.start + 1 for chunk in validated
         )
@@ -361,11 +384,14 @@ def split_pdf(
                 )
 
             target = out_dir / chunk_filename(src.stem, chunk)
-            if target.resolve() == src.resolve():
-                # 即使允许覆盖也不能覆盖正在读取的源文件。
-                target = unique_path(target)
-            elif not overwrite and target.exists():
-                target = unique_path(target)
+            if target.exists():
+                # 目标不存在时不可能与源文件相同，无需 resolve。
+                same_as_source = (
+                    src_in_out_dir
+                    and target.name == src_resolved.name
+                ) or target.resolve() == src_resolved
+                if same_as_source or not overwrite:
+                    target = allocator.reserve(target)
 
             document = pymupdf.open()
             try:
@@ -375,7 +401,7 @@ def split_pdf(
                         from_page=chunk.start - 1,
                         to_page=chunk.end - 1,
                     )
-                    save_pdf_atomic(document, target)
+                    save_pdf_atomic(document, target, preset="fast")
                 except Exception as exc:  # noqa: BLE001 - 统一转中文提示
                     raise PdfError(
                         f"拆分第 {chunk.start}-{chunk.end} 页失败："
@@ -398,6 +424,7 @@ def split_pdf(
 
 
 class PdfMergeSplitPage(ToolPage):
+    shutdown_label = "PDF 处理"
     """PDF 合并 / 拆分工具页。"""
 
     def __init__(self) -> None:
@@ -854,7 +881,8 @@ class PdfMergeSplitPage(ToolPage):
 
     def _finish_merge(self, result: MergeResult) -> None:
         self.progress_bar.setValue(100)
-        self._last_output_dir = result.output.resolve().parent
+        if self._last_output_dir is None:
+            self._last_output_dir = result.output.resolve().parent
         if self._last_output_dir.is_dir():
             self.open_btn.setEnabled(True)
         self._set_status(
