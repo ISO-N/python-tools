@@ -13,10 +13,15 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import (
+    CancelledError,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,11 +39,20 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from toolbox.common import human_size, open_directory, unique_path
+from toolbox.common import (
+    UniquePathAllocator,
+    human_size,
+    open_directory,
+)
 from toolbox.fileops import execute_moves, prune_empty_dirs
 from toolbox.page import ToolPage
 from toolbox.ui import PAGE_MARGINS, add_path_row, make_form
-from toolbox.workers import Cancelled, SingleTaskWorker, shutdown_worker
+from toolbox.workers import (
+    Cancelled,
+    MAX_HASH_WORKERS,
+    SingleTaskWorker,
+    shutdown_worker,
+)
 
 HASH_CHUNK_SIZE = 1024 * 1024
 PREFIX_HASH_SIZE = 64 * 1024
@@ -81,23 +95,112 @@ class _FileRecord:
 
     path: Path
     size: int
+    #: 扫描时的大小与 mtime，用作前缀哈希阶段的“读取前”签名。
+    signature: tuple[int, int]
+
+
+@dataclass
+class _PrefixRecord:
+    """前缀哈希阶段的结果，供完整哈希阶段复用。"""
+
+    record: _FileRecord
+    digest_hex: str
+    digest: object
+    bytes_read: int
+    signature: tuple[int, int]
+
+
+@dataclass
+class _PrefixOutcome:
+    """一个文件的前缀哈希结果。"""
+
+    prefix: str
+    digest: object
+    bytes_read: int
+    signature: tuple[int, int]
+
+
+@dataclass
+class _FullHashOutcome:
+    """一个文件的完整哈希结果与读取前后签名。"""
+
+    before: tuple[int, int]
+    digest: str
+    after: tuple[int, int]
 
 
 # --------------------------------------------------------------------- 纯逻辑
 
 
-def hash_file(
+def _run_ordered(
+    items: Sequence[object],
+    task: Callable[[object], object],
+    *,
+    max_workers: int,
+    cancel_event: threading.Event | None,
+    handle_result: Callable[[int, object], None],
+    handle_error: Callable[[int, BaseException], None],
+) -> None:
+    """在线程池中执行 ``task``，严格按输入顺序交回结果。
+
+    提交窗口限制为 ``workers * 2``，避免一次性排满大量文件读取任务。
+    取消时停止提交、等待运行中的任务结束并抛出 :class:`Cancelled`；
+    普通异常交给 ``handle_error`` 按顺序记录。
+    """
+    items = list(items)
+    if not items:
+        return
+    workers = max(1, int(max_workers))
+    window = max(1, min(workers * 2, len(items)))
+    executor = ThreadPoolExecutor(max_workers=workers)
+    pending: dict[int, Future[object]] = {}
+    next_submit = 0
+    try:
+        for index in range(len(items)):
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled()
+            while next_submit < len(items) and len(pending) < window:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise Cancelled()
+                pending[next_submit] = executor.submit(
+                    task, items[next_submit]
+                )
+                next_submit += 1
+
+            future = pending.pop(index)
+            while not future.done():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise Cancelled()
+                wait((future,), timeout=0.1)
+            try:
+                value = future.result()
+            except Cancelled:
+                raise
+            except CancelledError:
+                raise Cancelled() from None
+            except Exception as exc:  # noqa: BLE001 - 交给调用方分类
+                handle_error(index, exc)
+            else:
+                handle_result(index, value)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _new_digest() -> "hashlib._Hash":
+    return hashlib.blake2b(digest_size=32)
+
+
+def _hash_suffix(
     path: Path,
+    digest: "hashlib._Hash",
+    offset: int,
     cancel_event: threading.Event | None = None,
     on_chunk: Callable[[int], None] | None = None,
 ) -> str:
-    """计算文件的 BLAKE2b 摘要（32 字节，返回十六进制字符串）。
-
-    每次读取 1 MiB；每块读取前检查 ``cancel_event``，已取消时抛出
-    ``toolbox.workers.Cancelled``。``on_chunk`` 在每块读取后回调本次字节数。
-    """
-    digest = hashlib.blake2b(digest_size=32)
+    """从 ``offset`` 处续算摘要，返回十六进制字符串。"""
     with Path(path).open("rb") as handle:
+        if offset:
+            handle.seek(offset)
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 raise Cancelled()
@@ -110,16 +213,40 @@ def hash_file(
     return digest.hexdigest()
 
 
+def hash_file(
+    path: Path,
+    cancel_event: threading.Event | None = None,
+    on_chunk: Callable[[int], None] | None = None,
+) -> str:
+    """计算文件的 BLAKE2b 摘要（32 字节，返回十六进制字符串）。
+
+    每次读取 1 MiB；每块读取前检查 ``cancel_event``，已取消时抛出
+    ``toolbox.workers.Cancelled``。``on_chunk`` 在每块读取后回调本次字节数。
+    """
+    return _hash_suffix(
+        Path(path),
+        _new_digest(),
+        0,
+        cancel_event=cancel_event,
+        on_chunk=on_chunk,
+    )
+
+
 def _hash_prefix(
     path: Path, cancel_event: threading.Event | None = None
-) -> str:
-    """计算文件前 64 KiB 的 BLAKE2b 摘要，用于快速区分候选文件。"""
+) -> tuple[str, "hashlib._Hash", int]:
+    """计算文件前 64 KiB 的摘要。
+
+    返回 ``(十六进制摘要, 可续算的摘要副本, 实际读取字节数)``，供完整
+    哈希阶段从 ``seek(bytes_read)`` 处继续，避免重复读取前缀。
+    """
     if cancel_event is not None and cancel_event.is_set():
         raise Cancelled()
-    digest = hashlib.blake2b(digest_size=32)
+    digest = _new_digest()
     with Path(path).open("rb") as handle:
-        digest.update(handle.read(PREFIX_HASH_SIZE))
-    return digest.hexdigest()
+        data = handle.read(PREFIX_HASH_SIZE)
+    digest.update(data)
+    return digest.hexdigest(), digest.copy(), len(data)
 
 
 def _is_quarantine_dir_name(name: str) -> bool:
@@ -202,18 +329,22 @@ def find_duplicates(
                 continue
             path = current / name
             try:
-                if path.is_symlink():
-                    continue
                 info = os.stat(path, follow_symlinks=False)
             except OSError as exc:
                 errors.append(f"{path}：{exc}")
+                continue
+            if stat.S_ISLNK(info.st_mode):
                 continue
             if not stat.S_ISREG(info.st_mode):
                 continue
             scanned_files += 1
             scanned_bytes += info.st_size
             by_size.setdefault(info.st_size, []).append(
-                _FileRecord(path=path, size=info.st_size)
+                _FileRecord(
+                    path=path,
+                    size=info.st_size,
+                    signature=(info.st_size, info.st_mtime_ns),
+                )
             )
 
     candidates = [
@@ -231,58 +362,138 @@ def find_duplicates(
     if on_progress is not None:
         on_progress(0, total)
 
-    # 第一轮：只读前 64 KiB，把前缀不同的候选文件排除。
-    full_hash_batches: list[list[_FileRecord]] = []
-    for records in candidates:
-        prefix_groups: dict[str, list[_FileRecord]] = {}
+    # 第一轮：只读前 64 KiB，把前缀不同的候选文件排除。扫描阶段已经
+    # 做过一次 stat，因此这里只需在读取后再取一次签名。
+    workers = max(1, int(MAX_HASH_WORKERS))
+    flat_candidates: list[tuple[int, _FileRecord]] = []
+    for group_index, records in enumerate(candidates):
         for record in records:
-            try:
-                before = _signature(record.path)
-                prefix = _hash_prefix(record.path, cancel_event)
-                after = _signature(record.path)
-            except OSError as exc:
-                errors.append(f"{record.path}：{exc}")
-                advance()
-                continue
-            if before != after:
-                errors.append(
-                    f"{record.path}：读取期间文件发生变化，已跳过"
-                )
-                advance()
-                continue
-            prefix_groups.setdefault(prefix, []).append(record)
+            flat_candidates.append((group_index, record))
 
-        for batch in prefix_groups.values():
+    prefix_groups_by_candidate: dict[int, dict[str, list[_PrefixRecord]]] = {
+        index: {} for index in range(len(candidates))
+    }
+
+    def hash_prefix_task(record: _FileRecord) -> _PrefixOutcome:
+        prefix, digest, bytes_read = _hash_prefix(
+            record.path, cancel_event
+        )
+        after = _signature(record.path)
+        return _PrefixOutcome(prefix, digest, bytes_read, after)
+
+    def handle_prefix(index: int, value: object) -> None:
+        group_index, record = flat_candidates[index]
+        outcome = value
+        if record.signature != outcome.signature:
+            errors.append(
+                f"{record.path}：读取期间文件发生变化，已跳过"
+            )
+            advance()
+            return
+        prefix_groups_by_candidate[group_index].setdefault(
+            outcome.prefix, []
+        ).append(
+            _PrefixRecord(
+                record=record,
+                digest_hex=outcome.prefix,
+                digest=outcome.digest,
+                bytes_read=outcome.bytes_read,
+                signature=outcome.signature,
+            )
+        )
+
+    def handle_prefix_error(index: int, exc: BaseException) -> None:
+        if not isinstance(exc, OSError):
+            raise exc
+        _group_index, record = flat_candidates[index]
+        errors.append(f"{record.path}：{exc}")
+        advance()
+
+    _run_ordered(
+        [record for _group_index, record in flat_candidates],
+        hash_prefix_task,
+        max_workers=workers,
+        cancel_event=cancel_event,
+        handle_result=handle_prefix,
+        handle_error=handle_prefix_error,
+    )
+
+    full_hash_batches: list[list[_PrefixRecord]] = []
+    for group_index, _records in enumerate(candidates):
+        for batch in prefix_groups_by_candidate[group_index].values():
             if len(batch) >= 2:
                 full_hash_batches.append(batch)
             else:
                 # 前缀唯一，不可能与其他文件内容相同。
-                for _record in batch:
+                for _entry in batch:
                     advance()
 
-    # 第二轮：完整哈希，确认内容完全相同。
-    groups: list[DuplicateGroup] = []
-    for batch in full_hash_batches:
-        digest_groups: dict[str, list[_FileRecord]] = {}
-        for record in batch:
-            try:
-                before = _signature(record.path)
-                digest = hash_file(record.path, cancel_event=cancel_event)
-                after = _signature(record.path)
-            except OSError as exc:
-                errors.append(f"{record.path}：{exc}")
-                advance()
-                continue
-            if before != after:
-                errors.append(
-                    f"{record.path}：读取期间文件发生变化，已跳过"
-                )
-                advance()
-                continue
-            digest_groups.setdefault(digest, []).append(record)
-            advance()
+    # 第二轮：完整哈希，确认内容完全相同。前缀阶段已读过的部分不再
+    # 读取；文件大小不超过前缀长度时直接复用前缀摘要。
+    flat_entries: list[tuple[int, _PrefixRecord]] = []
+    for batch_index, batch in enumerate(full_hash_batches):
+        for entry in batch:
+            flat_entries.append((batch_index, entry))
 
-        for digest, matched in digest_groups.items():
+    digest_groups_by_batch: dict[int, dict[str, list[_FileRecord]]] = {
+        index: {} for index in range(len(full_hash_batches))
+    }
+
+    def hash_full_task(entry: _PrefixRecord) -> _FullHashOutcome:
+        record = entry.record
+        before = _signature(record.path)
+        if before == entry.signature:
+            if record.size <= PREFIX_HASH_SIZE:
+                digest = entry.digest_hex
+            else:
+                # 复制前缀摘要后在当前线程继续计算，摘要对象不跨线程并发使用。
+                work = entry.digest.copy()  # type: ignore[attr-defined]
+                digest = _hash_suffix(
+                    record.path,
+                    work,
+                    entry.bytes_read,
+                    cancel_event=cancel_event,
+                )
+        else:
+            # 前缀阶段之后文件已变化，丢弃旧前缀并从 0 重新哈希。
+            digest = hash_file(record.path, cancel_event=cancel_event)
+        after = _signature(record.path)
+        return _FullHashOutcome(before, digest, after)
+
+    def handle_full(index: int, value: object) -> None:
+        batch_index, entry = flat_entries[index]
+        record = entry.record
+        outcome = value
+        if outcome.before != outcome.after:
+            errors.append(
+                f"{record.path}：读取期间文件发生变化，已跳过"
+            )
+            advance()
+            return
+        digest_groups_by_batch[batch_index].setdefault(
+            outcome.digest, []
+        ).append(record)
+        advance()
+
+    def handle_full_error(index: int, exc: BaseException) -> None:
+        if not isinstance(exc, OSError):
+            raise exc
+        _batch_index, entry = flat_entries[index]
+        errors.append(f"{entry.record.path}：{exc}")
+        advance()
+
+    _run_ordered(
+        [entry for _batch_index, entry in flat_entries],
+        hash_full_task,
+        max_workers=workers,
+        cancel_event=cancel_event,
+        handle_result=handle_full,
+        handle_error=handle_full_error,
+    )
+
+    groups: list[DuplicateGroup] = []
+    for batch_index, _batch in enumerate(full_hash_batches):
+        for digest, matched in digest_groups_by_batch[batch_index].items():
             if len(matched) < 2:
                 continue
             files = sorted(
@@ -317,29 +528,19 @@ def quarantine_root_for(root: Path) -> Path:
     return root.parent / f"{root.name}_quarantine_{timestamp}"
 
 
-def _unique_planned_path(target: Path, planned: set[Path]) -> Path:
-    """在 ``unique_path`` 基础上避免同一批次内计划出重复目标。"""
-    candidate = unique_path(target)
-    counter = 1
-    while candidate in planned:
-        alternative = target.with_name(
-            f"{target.stem} ({counter}){target.suffix}"
-        )
-        candidate = unique_path(alternative)
-        counter += 1
-    planned.add(candidate)
-    return candidate
-
-
 def build_quarantine_items(
     root: Path,
     quarantine_root: Path,
     selected: list[tuple[Path, DuplicateGroup]],
 ) -> list[tuple[Path, Path]]:
-    """把勾选的文件映射为（原路径, 隔离路径），保留相对扫描根目录的结构。"""
+    """把勾选的文件映射为（原路径, 隔离路径），保留相对扫描根目录的结构。
+
+    使用 :class:`toolbox.common.UniquePathAllocator`（``reserve_planned``
+    模式）一次建立目录名字快照，避免对同一隔离目录做 O(k²) 的重复探测。
+    """
     root = Path(root)
     quarantine_root = Path(quarantine_root)
-    planned: set[Path] = set()
+    allocator = UniquePathAllocator(reserve_planned=True)
     items: list[tuple[Path, Path]] = []
     for path, _group in selected:
         path = Path(path)
@@ -347,7 +548,7 @@ def build_quarantine_items(
             relative = path.relative_to(root)
         except ValueError:
             relative = Path(path.name)
-        target = _unique_planned_path(quarantine_root / relative, planned)
+        target = allocator.reserve(quarantine_root / relative)
         items.append((path, target))
     return items
 
@@ -417,24 +618,12 @@ def _write_manifest(
     _write_manifest_records(quarantine_root, [*existing, *new_records])
 
 
-def move_to_quarantine(
-    items: Sequence[tuple[Path, Path]],
-    quarantine_root: Path,
-    *,
-    known_digests: Mapping[Path, str] | None = None,
-) -> tuple[list[QuarantineMove], list[str]]:
-    """把文件移动到隔离区，成功后写 manifest，返回（成功记录, 错误）。
-
-    移动使用 ``execute_moves(..., overwrite=False)``，绝不删除已有文件。
-    ``known_digests`` 可传入扫描阶段已计算的摘要，避免移动后重复读取大文件；
-    缺失时再回退到完整哈希。manifest 写入失败只记录错误，不回滚已经完成的
-    移动。
-    """
-    quarantine_root = Path(quarantine_root)
-    _moved, _skipped, errors, moved_items = execute_moves(
-        list(items), overwrite=False
-    )
-
+def _build_quarantine_moves(
+    moved_items: Sequence[tuple[Path, Path]],
+    known_digests: Mapping[Path, str] | None,
+    errors: list[str],
+) -> list[QuarantineMove]:
+    """把成功的移动项转换为隔离记录，必要时补算摘要。"""
     moves: list[QuarantineMove] = []
     for original, quarantined in moved_items:
         original = Path(original)
@@ -461,14 +650,63 @@ def move_to_quarantine(
                 digest=digest,
             )
         )
+    return moves
 
-    if moves:
-        try:
-            _write_manifest(quarantine_root, moves)
-        except Exception as exc:  # noqa: BLE001 - 清单失败不回滚
-            errors.append(
-                f"无法写入隔离清单 {quarantine_root / 'manifest.json'}：{exc}"
-            )
+
+def _write_quarantine_manifest(
+    quarantine_root: Path,
+    moves: Sequence[QuarantineMove],
+    errors: list[str],
+) -> None:
+    if not moves:
+        return
+    try:
+        _write_manifest(quarantine_root, moves)
+    except Exception as exc:  # noqa: BLE001 - 清单失败不回滚
+        errors.append(
+            f"无法写入隔离清单 {quarantine_root / 'manifest.json'}：{exc}"
+        )
+
+
+def move_to_quarantine(
+    items: Sequence[tuple[Path, Path]],
+    quarantine_root: Path,
+    *,
+    known_digests: Mapping[Path, str] | None = None,
+    cancel_event: threading.Event | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[list[QuarantineMove], list[str]]:
+    """把文件移动到隔离区，成功后写 manifest，返回（成功记录, 错误）。
+
+    移动使用 ``execute_moves(..., overwrite=False)``，绝不删除已有文件。
+    ``known_digests`` 可传入扫描阶段已计算的摘要，避免移动后重复读取大文件；
+    缺失时再回退到完整哈希。manifest 写入失败只记录错误，不回滚已经完成的
+    移动。取消时先把已完成项的记录写入 manifest，再抛出
+    :class:`toolbox.errors.Cancelled`，其 ``result`` 为 ``(moves, errors)``。
+    """
+    quarantine_root = Path(quarantine_root)
+
+    try:
+        result = execute_moves(
+            list(items),
+            overwrite=False,
+            cancel_event=cancel_event,
+            on_progress=on_progress,
+        )
+    except Cancelled as exc:
+        partial = exc.result
+        errors = list(getattr(partial, "errors", ()))
+        moves = _build_quarantine_moves(
+            getattr(partial, "moved_items", ()), known_digests, errors
+        )
+        _write_quarantine_manifest(quarantine_root, moves, errors)
+        raise Cancelled((moves, errors)) from exc
+
+    errors = list(result.errors)
+    moves = _build_quarantine_moves(
+        result.moved_items, known_digests, errors
+    )
+    _write_quarantine_manifest(quarantine_root, moves, errors)
     return moves, errors
 
 
@@ -507,16 +745,42 @@ def _manifest_roots(moves: Sequence[QuarantineMove]) -> set[Path]:
     return roots
 
 
+def _finalize_quarantine_undo(
+    moves: Sequence[QuarantineMove],
+    moved: Sequence[tuple[Path, Path]],
+    errors: list[str],
+) -> None:
+    """移回成功后更新 manifest 并清理隔离区空目录。"""
+    if not moved:
+        return
+    successful = {source for source, _target in moved}
+    roots = _manifest_roots(
+        [move for move in moves if Path(move.quarantined) in successful]
+    )
+    restored_paths = {str(path) for path in successful}
+    for root in roots:
+        try:
+            _remove_manifest_entries(root, restored_paths)
+        except Exception as exc:  # noqa: BLE001 - 清单失败不影响移回
+            errors.append(f"{_manifest_path(root)}：更新隔离清单失败：{exc}")
+        prune_empty_dirs(root)
+
+
 def undo_quarantine(
     moves: Sequence[QuarantineMove],
+    *,
+    cancel_event: threading.Event | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[tuple[Path, Path]], list[str]]:
     """把隔离文件逐个移回原位置。
 
     返回（成功移回的（隔离路径, 原路径）列表, 错误列表）。原位置已存在
     文件时不覆盖，对应文件继续留在隔离区。成功移动后清理隔离区空目录。
+    取消时先完成已移回文件的清单更新与目录清理，再抛出
+    :class:`toolbox.errors.Cancelled`，其 ``result`` 为 ``(moved, errors)``。
     """
-    moved: list[tuple[Path, Path]] = []
     errors: list[str] = []
+    candidates: list[tuple[Path, Path]] = []
     for move in moves:
         source = Path(move.quarantined)
         target = Path(move.original)
@@ -530,26 +794,33 @@ def undo_quarantine(
                     "文件继续保留在隔离区"
                 )
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source), str(target))
-        except Exception as exc:  # noqa: BLE001 - 单项失败继续
+        except OSError as exc:
             errors.append(f"{source} → {target}：{exc}")
-        else:
-            moved.append((source, target))
+            continue
+        candidates.append((source, target))
 
-    if moved:
-        successful = {source for source, _target in moved}
-        roots = _manifest_roots(
-            [move for move in moves if Path(move.quarantined) in successful]
-        )
-        restored_paths = {str(path) for path in successful}
-        for root in roots:
-            try:
-                _remove_manifest_entries(root, restored_paths)
-            except Exception as exc:  # noqa: BLE001 - 清单失败不影响移回
-                errors.append(f"{_manifest_path(root)}：更新隔离清单失败：{exc}")
-            prune_empty_dirs(root)
+    moved: list[tuple[Path, Path]] = []
+    if candidates:
+        try:
+            result = execute_moves(
+                candidates,
+                overwrite=False,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+                error_formatter=lambda src, dst, exc: (
+                    f"{src} → {dst}：{exc}"
+                ),
+            )
+        except Cancelled as exc:
+            partial = exc.result
+            moved = list(getattr(partial, "moved_items", ()))
+            errors.extend(getattr(partial, "errors", ()))
+            _finalize_quarantine_undo(moves, moved, errors)
+            raise Cancelled((moved, errors)) from exc
+        moved = list(result.moved_items)
+        errors.extend(result.errors)
 
+    _finalize_quarantine_undo(moves, moved, errors)
     return moved, errors
 
 
@@ -557,6 +828,7 @@ def undo_quarantine(
 
 
 class DuplicateFinderPage(ToolPage):
+    shutdown_label = "重复文件处理"
     """重复文件查找工具页。"""
 
     def __init__(self) -> None:
@@ -567,6 +839,8 @@ class DuplicateFinderPage(ToolPage):
         self._scan_result: DuplicateScanResult | None = None
         self._quarantine_path: Path | None = None
         self._moves: list[QuarantineMove] = []
+        self._checked: dict[Path, DuplicateGroup] = {}
+        self._checked_savings = 0
         self._input_widgets: list[object] = []
         self._build_ui()
         self._refresh_actions()
@@ -768,14 +1042,36 @@ class DuplicateFinderPage(ToolPage):
             )
             return None
 
+    def _refresh_checked_status(self) -> None:
+        self._set_status(
+            f"已勾选 {len(self._checked)} 个文件，"
+            f"可节省 {human_size(self._checked_savings)}。"
+        )
+
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if column != 0 or item.parent() is None:
             return
-        entries = self._checked_entries()
-        savings = sum(group.size for _path, group in entries)
-        self._set_status(
-            f"已勾选 {len(entries)} 个文件，可节省 {human_size(savings)}。"
-        )
+        path_text = item.data(0, Qt.ItemDataRole.UserRole)
+        if not path_text or self._scan_result is None:
+            return
+        parent = item.parent()
+        group_index = parent.data(0, Qt.ItemDataRole.UserRole)
+        groups = self._scan_result.groups
+        if not isinstance(group_index, int) or not (
+            0 <= group_index < len(groups)
+        ):
+            return
+        path = Path(path_text)
+        if item.checkState(0) == Qt.CheckState.Checked:
+            if path not in self._checked:
+                group = groups[group_index]
+                self._checked[path] = group
+                self._checked_savings += group.size
+        else:
+            previous = self._checked.pop(path, None)
+            if previous is not None:
+                self._checked_savings -= previous.size
+        self._refresh_checked_status()
 
     # --------------------------------------------------------------- 扫描流程
 
@@ -900,6 +1196,8 @@ class DuplicateFinderPage(ToolPage):
     def _populate_tree(self) -> None:
         """按扫描结果重建树；每组第一个文件默认保留（不勾选）。"""
         groups = self._scan_result.groups if self._scan_result else []
+        self._checked = {}
+        self._checked_savings = 0
         self.tree.blockSignals(True)
         try:
             self.tree.clear()
@@ -934,38 +1232,25 @@ class DuplicateFinderPage(ToolPage):
                         | Qt.ItemFlag.ItemIsSelectable
                         | Qt.ItemFlag.ItemIsUserCheckable
                     )
+                    checked = file_index != 0
                     child.setCheckState(
                         0,
-                        Qt.CheckState.Unchecked
-                        if file_index == 0
-                        else Qt.CheckState.Checked,
+                        Qt.CheckState.Checked
+                        if checked
+                        else Qt.CheckState.Unchecked,
                     )
+                    if checked:
+                        self._checked[path] = group
+                        self._checked_savings += group.size
                 parent.setExpanded(True)
         finally:
             self.tree.blockSignals(False)
 
     def _checked_entries(self) -> list[tuple[Path, DuplicateGroup]]:
         """返回当前勾选的（文件路径, 所属组）。"""
-        entries: list[tuple[Path, DuplicateGroup]] = []
         if self._scan_result is None:
-            return entries
-        groups = self._scan_result.groups
-        for parent_index in range(self.tree.topLevelItemCount()):
-            parent = self.tree.topLevelItem(parent_index)
-            group_index = parent.data(0, Qt.ItemDataRole.UserRole)
-            if not isinstance(group_index, int) or not (
-                0 <= group_index < len(groups)
-            ):
-                continue
-            group = groups[group_index]
-            for child_index in range(parent.childCount()):
-                child = parent.child(child_index)
-                if child.checkState(0) != Qt.CheckState.Checked:
-                    continue
-                path_text = child.data(0, Qt.ItemDataRole.UserRole)
-                if path_text:
-                    entries.append((Path(path_text), group))
-        return entries
+            return []
+        return list(self._checked.items())
 
     def _auto_uncheck_full_groups(
         self,
@@ -988,7 +1273,11 @@ class DuplicateFinderPage(ToolPage):
                     first = parent.child(0)
                     path_text = first.data(0, Qt.ItemDataRole.UserRole)
                     if path_text:
-                        kept.append(Path(path_text))
+                        path = Path(path_text)
+                        kept.append(path)
+                        previous = self._checked.pop(path, None)
+                        if previous is not None:
+                            self._checked_savings -= previous.size
                     first.setCheckState(0, Qt.CheckState.Unchecked)
         finally:
             self.tree.blockSignals(False)
@@ -1230,6 +1519,8 @@ class DuplicateFinderPage(ToolPage):
 
         # 原位置可能已恢复出新的重复文件，清空旧扫描结果避免误操作。
         self._scan_result = None
+        self._checked = {}
+        self._checked_savings = 0
         self.tree.clear()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)

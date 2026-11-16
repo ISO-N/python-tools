@@ -13,11 +13,14 @@
 from __future__ import annotations
 
 import bisect
+import os
 import re
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from PyQt6.QtCore import QThread
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -27,6 +30,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -39,11 +43,13 @@ from toolbox.chapters import (
 )
 from toolbox.common import open_directory
 from toolbox.fileops import (
+    MoveExecutionResult,
     execute_moves,
     find_conflicts,
     remove_empty_dirs,
 )
 from toolbox.page import ToolPage
+from toolbox.workers import Cancelled, SingleTaskWorker
 
 # 兼容旧名称：本工具原先把解析函数命名为 parse_folder_config。
 parse_folder_config = parse_chapter_config
@@ -98,20 +104,35 @@ def extract_page_number(path: Path) -> int | None:
     return int(match.group(1))
 
 
-def scan_images(folder: Path) -> tuple[list[tuple[int, Path]], list[Path]]:
-    """扫描目录第一层，返回（按页码排序的图片, 无法识别页码的图片）。"""
+def scan_images(
+    folder: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[list[tuple[int, Path]], list[Path]]:
+    """扫描目录第一层，返回（按页码排序的图片, 无法识别页码的图片）。
+
+    ``cancel_event`` 在每个目录项前检查，取消时抛出
+    :class:`toolbox.errors.Cancelled`。
+    """
     folder = Path(folder)
     matched: list[tuple[int, Path]] = []
     unrecognized: list[Path] = []
-    for entry in sorted(folder.iterdir(), key=lambda item: item.name):
-        if not entry.is_file():
-            continue
-        page = extract_page_number(entry)
-        if page is None:
-            if entry.suffix.lower() in IMAGE_EXTENSIONS:
-                unrecognized.append(entry)
-            continue
-        matched.append((page, entry))
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled()
+            try:
+                if not entry.is_file():
+                    continue
+            except OSError:
+                continue
+            path = Path(entry.path)
+            page = extract_page_number(path)
+            if page is None:
+                if path.suffix.lower() in IMAGE_EXTENSIONS:
+                    unrecognized.append(path)
+                continue
+            matched.append((page, path))
     matched.sort(key=lambda item: (item[0], item[1].name))
     return matched, unrecognized
 
@@ -151,6 +172,84 @@ def build_move_items(
         for _page, src in group.images:
             items.append((src, base_dir / group.name / src.name))
     return items
+
+
+class ArchivePlanCache:
+    """最近一次归档计划缓存；键不匹配即视为未命中。"""
+
+    def __init__(self) -> None:
+        self._key: tuple[object, ...] | None = None
+        self._plan: ArchivePlan | None = None
+
+    def get(self, key: tuple[object, ...]) -> ArchivePlan | None:
+        if key == self._key:
+            return self._plan
+        return None
+
+    def put(self, key: tuple[object, ...], plan: ArchivePlan) -> None:
+        self._key = key
+        self._plan = plan
+
+    def clear(self) -> None:
+        self._key = None
+        self._plan = None
+
+
+def directory_mtime_ns(folder: Path) -> int:
+    """返回目录 mtime（纳秒）；目录不可读时返回 -1。"""
+    try:
+        return Path(folder).stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
+def archive_plan_cache_key(
+    folder: Path, diff: int, config_text: str
+) -> tuple[object, ...]:
+    """生成计划缓存键：目录、差值、配置文本与目录 mtime。"""
+    return (
+        Path(folder),
+        int(diff),
+        str(config_text),
+        directory_mtime_ns(folder),
+    )
+
+
+def build_archive_plan(
+    folder: Path,
+    diff: int,
+    config_text: str,
+    cache: ArchivePlanCache | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> ArchivePlan:
+    """扫描并生成归档计划；提供 ``cache`` 时复用未失效的计划。"""
+    folder = Path(folder)
+    key = archive_plan_cache_key(folder, diff, config_text)
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+    images, unrecognized = scan_images(folder, cancel_event=cancel_event)
+    if images:
+        config = parse_folder_config(config_text)
+        groups, unassigned = build_move_plan(images, int(diff), config)
+    else:
+        groups = []
+        unassigned = []
+
+    plan = ArchivePlan(
+        folder=folder,
+        diff=int(diff),
+        images=images,
+        groups=groups,
+        unassigned=unassigned,
+        unrecognized=unrecognized,
+    )
+    if cache is not None:
+        cache.put(key, plan)
+    return plan
 
 
 def detect_stems(images: Sequence[tuple[int, Path]]) -> list[str]:
@@ -227,10 +326,30 @@ def format_preview(plan: ArchivePlan) -> str:
 class MoveImagesPage(ToolPage):
     """图片按页码归档工具页。"""
 
+    shutdown_label = "移动"
+
     def __init__(self) -> None:
         super().__init__()
         self._undo_items: list[tuple[Path, Path]] = []
+        self._plan_cache = ArchivePlanCache()
+        self._worker: SingleTaskWorker | None = None
+        self._busy = False
+        self._pending_move: (
+            tuple[ArchivePlan, list[tuple[Path, Path]], list[tuple[Path, Path]]]
+            | None
+        ) = None
+        self._pending_undo: (
+            tuple[
+                list[tuple[Path, Path]],
+                list[tuple[Path, Path]],
+                list[tuple[Path, Path]],
+            ]
+            | None
+        ) = None
         self._build_ui()
+
+    def current_worker(self) -> QThread | None:
+        return self._worker
 
     # ------------------------------------------------------------------ UI
 
@@ -249,11 +368,11 @@ class MoveImagesPage(ToolPage):
             "选择「PDF 转图片」产出的图片文件夹"
         )
         self.folder_edit.textChanged.connect(self._update_open_button)
-        browse_btn = QPushButton("浏览…")
-        browse_btn.clicked.connect(self._browse_folder)
+        self.browse_btn = QPushButton("浏览…")
+        self.browse_btn.clicked.connect(self._browse_folder)
         form.addWidget(QLabel("图片文件夹："), 0, 0)
         form.addWidget(self.folder_edit, 0, 1)
-        form.addWidget(browse_btn, 0, 2)
+        form.addWidget(self.browse_btn, 0, 2)
 
         self.diff_spin = QSpinBox()
         self.diff_spin.setRange(DIFF_MIN, DIFF_MAX)
@@ -293,6 +412,9 @@ class MoveImagesPage(ToolPage):
         self.move_btn = QPushButton("开始移动")
         self.move_btn.setDefault(True)
         self.move_btn.clicked.connect(self._start_move)
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_task)
         self.undo_btn = QPushButton("撤销移动")
         self.undo_btn.setEnabled(False)
         self.undo_btn.setToolTip("撤销上一次移动（暂无可撤销的操作）")
@@ -304,12 +426,19 @@ class MoveImagesPage(ToolPage):
         buttons.addSpacing(16)
         buttons.addWidget(self.preview_btn)
         buttons.addWidget(self.move_btn)
+        buttons.addWidget(self.cancel_btn)
         buttons.addWidget(self.undo_btn)
         buttons.addWidget(self.open_btn)
         buttons.addStretch(1)
         form.addLayout(buttons, 5, 0, 1, 3)
 
         layout.addLayout(form)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        layout.addWidget(self.progress_bar)
 
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
@@ -339,19 +468,23 @@ class MoveImagesPage(ToolPage):
         self.status_label.setText(text)
 
     def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
         for widget in (
             self.copy_prompt_btn,
             self.preview_btn,
             self.move_btn,
             self.folder_edit,
+            self.browse_btn,
             self.config_edit,
             self.diff_spin,
         ):
             widget.setEnabled(not busy)
         if busy:
+            self.cancel_btn.setEnabled(True)
             self.open_btn.setEnabled(False)
             self.undo_btn.setEnabled(False)
         else:
+            self.cancel_btn.setEnabled(False)
             self._update_open_button()
             self._refresh_undo_button()
 
@@ -365,10 +498,8 @@ class MoveImagesPage(ToolPage):
 
     # --------------------------------------------------------------- 归档流程
 
-    def _load_folder_images(
-        self,
-    ) -> tuple[Path, list[tuple[int, Path]], list[Path]] | None:
-        """校验图片文件夹并扫描图片；失败时弹窗并返回 None。"""
+    def _validate_folder(self) -> Path | None:
+        """校验图片文件夹输入；失败时弹窗并返回 None。"""
         folder_text = self.folder_edit.text().strip()
         if not folder_text:
             QMessageBox.warning(
@@ -381,47 +512,110 @@ class MoveImagesPage(ToolPage):
                 self, "文件夹不存在", f"目录不存在：\n{folder}"
             )
             return None
+        return folder
 
-        try:
-            images, unrecognized = scan_images(folder)
-        except OSError as exc:
+    def _collect_plan_inputs(
+        self,
+    ) -> tuple[Path, int, str] | None:
+        """校验图片文件夹并收集生成计划所需的输入。"""
+        folder = self._validate_folder()
+        if folder is None:
+            return None
+        return (
+            folder,
+            self.diff_spin.value(),
+            self.config_edit.toPlainText(),
+        )
+
+    def _show_plan_error(self, error: Exception) -> None:
+        if isinstance(error, ConfigError):
+            QMessageBox.warning(self, "JSON 配置错误", str(error))
+        elif isinstance(error, OSError):
             QMessageBox.critical(
-                self, "无法读取文件夹", f"{folder}\n{exc}"
+                self, "无法读取文件夹", str(error)
             )
-            return None
-
-        if not images:
-            detail = ""
-            if unrecognized:
-                detail = (
-                    f"\n\n检测到 {len(unrecognized)} 个图片文件，"
-                    "但文件名不符合 `..._page_数字.扩展名` 格式。"
-                )
-            QMessageBox.warning(
-                self,
-                "没有可处理的图片",
-                "该文件夹中未找到符合 `*_page_数字.png/jpg` 命名的图片。"
-                + detail,
+        else:
+            QMessageBox.critical(
+                self, "无法生成归档计划", str(error)
             )
-            return None
-        return folder, images, unrecognized
 
-    def _collect_plan(self) -> ArchivePlan | None:
-        """校验输入并生成归档计划；失败时弹窗并返回 None。"""
-        loaded = self._load_folder_images()
-        if loaded is None:
-            return None
-        folder, images, unrecognized = loaded
+    def _warn_no_images(self, plan: ArchivePlan) -> None:
+        detail = ""
+        if plan.unrecognized:
+            detail = (
+                f"\n\n检测到 {len(plan.unrecognized)} 个图片文件，"
+                "但文件名不符合 `..._page_数字.扩展名` 格式。"
+            )
+        QMessageBox.warning(
+            self,
+            "没有可处理的图片",
+            "该文件夹中未找到符合 `*_page_数字.png/jpg` 命名的图片。"
+            + detail,
+        )
+        self._set_status("没有可处理的图片")
 
+    def _build_plan_task(
+        self,
+        folder: Path,
+        diff: int,
+        config_text: str,
+        cancel_event: threading.Event,
+    ) -> object:
+        """后台线程：扫描并生成计划；可预期的错误作为结果返回。"""
         try:
-            config = parse_folder_config(self.config_edit.toPlainText())
-        except ConfigError as exc:
-            QMessageBox.warning(self, "JSON 配置错误", str(exc))
-            return None
+            plan = build_archive_plan(
+                folder,
+                diff,
+                config_text,
+                self._plan_cache,
+                cancel_event=cancel_event,
+            )
+        except (ConfigError, OSError) as exc:
+            return exc
+        if cancel_event.is_set():
+            raise Cancelled(plan)
+        return plan
 
-        diff = self.diff_spin.value()
-        groups, unassigned = build_move_plan(images, diff, config)
-        return ArchivePlan(folder, diff, images, groups, unassigned, unrecognized)
+    def _start_worker(
+        self,
+        task: Callable,
+        on_finished: Callable[[object], None],
+        on_cancelled: Callable[[object], None],
+        on_failed: Callable[[str], None],
+        on_progress: Callable[[object, object], None] | None = None,
+    ) -> None:
+        """创建 worker 并先连接全部信号，再启动线程。"""
+        worker = SingleTaskWorker(task, self)
+        if on_progress is not None:
+            worker.progress_changed.connect(on_progress)
+        worker.task_finished.connect(on_finished)
+        worker.task_cancelled.connect(on_cancelled)
+        worker.task_failed.connect(on_failed)
+        worker.finished.connect(self._on_worker_finished)
+        self._worker = worker
+        worker.start()
+
+    def _on_worker_finished(self) -> None:
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._set_busy(False)
+        pending = self._pending_move
+        self._pending_move = None
+        if pending is not None:
+            self._continue_move(*pending)
+        pending_undo = self._pending_undo
+        self._pending_undo = None
+        if pending_undo is not None:
+            self._continue_undo(*pending_undo)
+
+    def _cancel_task(self) -> None:
+        if self._worker is None or not self._worker.isRunning():
+            return
+        self._worker.cancel()
+        self.cancel_btn.setEnabled(False)
+        self._set_status("正在取消…")
 
     def _copy_ai_prompt(self) -> None:
         QApplication.clipboard().setText(AI_PROMPT)
@@ -433,17 +627,63 @@ class MoveImagesPage(ToolPage):
         )
 
     def _preview(self) -> None:
-        plan = self._collect_plan()
-        if plan is None:
+        if self._busy:
             return
-        self.output.setPlainText(format_preview(plan))
-        move_count = len(plan.move_items)
+        inputs = self._collect_plan_inputs()
+        if inputs is None:
+            return
+        folder, diff, config_text = inputs
+
+        def task(
+            on_progress: Callable[[object, object], None],
+            cancel_event: threading.Event,
+        ) -> object:
+            return self._build_plan_task(
+                folder, diff, config_text, cancel_event
+            )
+
+        self.progress_bar.setRange(0, 0)
+        self._set_busy(True)
+        self._set_status("正在扫描图片目录…")
+        self._start_worker(
+            task,
+            self._on_preview_finished,
+            self._on_preview_cancelled,
+            self._on_preview_failed,
+        )
+
+    def _on_preview_finished(self, result: object) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if isinstance(result, Exception):
+            self._show_plan_error(result)
+            return
+        if not isinstance(result, ArchivePlan):
+            self._on_preview_failed("后台任务返回了未知结果")
+            return
+        if not result.images:
+            self._warn_no_images(result)
+            return
+        self.output.setPlainText(format_preview(result))
+        move_count = len(result.move_items)
         if move_count:
             self._set_status(
-                f"预览完成：共识别 {len(plan.images)} 张，将移动 {move_count} 张"
+                f"预览完成：共识别 {len(result.images)} 张，"
+                f"将移动 {move_count} 张"
             )
         else:
             self._set_status("预览完成：当前配置没有可移动的图片")
+
+    def _on_preview_cancelled(self, _result: object) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status("已取消预览")
+
+    def _on_preview_failed(self, message: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status("预览失败")
+        QMessageBox.critical(self, "预览失败", message)
 
     def _ask_conflict_policy(
         self, count: int, location: str = "目标文件夹"
@@ -466,12 +706,93 @@ class MoveImagesPage(ToolPage):
         return None
 
     def _start_move(self) -> None:
-        plan = self._collect_plan()
-        if plan is None:
+        if self._busy:
             return
+        inputs = self._collect_plan_inputs()
+        if inputs is None:
+            return
+        folder, diff, config_text = inputs
 
+        def task(
+            on_progress: Callable[[object, object], None],
+            cancel_event: threading.Event,
+        ) -> object:
+            plan = self._build_plan_task(
+                folder, diff, config_text, cancel_event
+            )
+            if isinstance(plan, Exception):
+                return plan
+            items = plan.move_items
+            conflicts = find_conflicts(
+                items,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+            )
+            return plan, items, conflicts
+
+        self._pending_move = None
+        self.progress_bar.setRange(0, 0)
+        self._set_busy(True)
+        self._set_status("正在扫描图片目录并检查同名文件…")
+        self._start_worker(
+            task,
+            self._on_prepare_finished,
+            self._on_prepare_cancelled,
+            self._on_prepare_failed,
+            self._on_prepare_progress,
+        )
+
+    def _on_prepare_progress(self, done: object, total: object) -> None:
+        done_count, total_count = int(done), int(total)
+        if total_count <= 0:
+            self.progress_bar.setRange(0, 0)
+            self._set_status("正在扫描图片目录…")
+            return
+        self.progress_bar.setRange(0, 100)
+        percent = int(done_count / total_count * 100)
+        self.progress_bar.setValue(min(100, percent))
+        self._set_status(
+            f"正在检查同名文件：{done_count}/{total_count} 张…"
+        )
+
+    def _on_prepare_finished(self, result: object) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if isinstance(result, Exception):
+            self._show_plan_error(result)
+            return
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 3
+            or not isinstance(result[0], ArchivePlan)
+        ):
+            self._on_prepare_failed("后台任务返回了未知结果")
+            return
+        plan, items, conflicts = result
+        if not plan.images:
+            self._warn_no_images(plan)
+            return
         self.output.setPlainText(format_preview(plan))
-        items = plan.move_items
+        # 等 worker 的 finished 信号后再显示对话框并启动执行 worker。
+        self._pending_move = (plan, items, conflicts)
+
+    def _on_prepare_cancelled(self, _result: object) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status("已取消移动")
+
+    def _on_prepare_failed(self, message: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status("移动失败")
+        QMessageBox.critical(self, "移动失败", message)
+
+    def _continue_move(
+        self,
+        plan: ArchivePlan,
+        items: list[tuple[Path, Path]],
+        conflicts: list[tuple[Path, Path]],
+    ) -> None:
         if not items:
             QMessageBox.information(
                 self,
@@ -482,7 +803,7 @@ class MoveImagesPage(ToolPage):
             return
 
         overwrite = False
-        conflicts = find_conflicts(items)
+        known_conflicts = {dst for _src, dst in conflicts}
         if conflicts:
             policy = self._ask_conflict_policy(len(conflicts))
             if policy is None:
@@ -497,7 +818,10 @@ class MoveImagesPage(ToolPage):
         )
         if conflicts:
             action = "覆盖" if overwrite else "跳过"
-            summary += f"\n\n其中 {len(conflicts)} 张的目标位置已存在同名文件（{action}）。"
+            summary += (
+                f"\n\n其中 {len(conflicts)} 张的目标位置已存在同名文件"
+                f"（{action}）。"
+            )
         reply = QMessageBox.question(
             self,
             "确认移动",
@@ -509,56 +833,189 @@ class MoveImagesPage(ToolPage):
             self._set_status("已取消移动")
             return
 
-        self._set_busy(True)
-        try:
-            moved, skipped, errors, moved_items = execute_moves(
-                items, overwrite=overwrite
-            )
-            if moved_items:
-                self._undo_items = list(moved_items)
-        finally:
-            self._set_busy(False)
+        self._start_move_worker(items, overwrite, known_conflicts)
 
-        result_lines = [f"完成：已移动 {moved} 张图片，跳过 {skipped} 张。"]
-        if errors:
+    def _start_move_worker(
+        self,
+        items: list[tuple[Path, Path]],
+        overwrite: bool,
+        known_conflicts: set[Path],
+    ) -> None:
+        def task(
+            on_progress: Callable[[object, object], None],
+            cancel_event: threading.Event,
+        ) -> MoveExecutionResult:
+            return execute_moves(
+                items,
+                overwrite=overwrite,
+                known_conflicts=known_conflicts,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+            )
+
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_busy(True)
+        self._set_status(f"正在移动 {len(items)} 张图片…")
+        self._start_worker(
+            task,
+            self._on_move_finished,
+            self._on_move_cancelled,
+            self._on_move_failed,
+            self._on_move_progress,
+        )
+
+    def _on_move_progress(self, done: object, total: object) -> None:
+        done_count, total_count = int(done), int(total)
+        percent = int(done_count / total_count * 100) if total_count else 0
+        self.progress_bar.setValue(min(100, percent))
+        self._set_status(f"正在移动：{done_count}/{total_count} 张…")
+
+    def _on_move_finished(self, result: object) -> None:
+        if not isinstance(result, MoveExecutionResult):
+            self._on_move_failed("后台任务返回了未知结果")
+            return
+
+        self.progress_bar.setValue(100)
+        if result.moved_items:
+            self._undo_items = list(result.moved_items)
+        self._refresh_undo_button()
+
+        result_lines = [
+            f"完成：已移动 {result.moved} 张图片，"
+            f"跳过 {result.skipped} 张。"
+        ]
+        if result.errors:
             result_lines.append("")
-            result_lines.append(f"失败 {len(errors)} 项：")
-            result_lines.extend(errors)
+            result_lines.append(f"失败 {len(result.errors)} 项：")
+            result_lines.extend(result.errors)
             self.output.setPlainText("\n".join(result_lines))
-            self._set_status(f"完成：移动 {moved} 张，失败 {len(errors)} 张")
+            self._set_status(
+                f"完成：移动 {result.moved} 张，"
+                f"失败 {len(result.errors)} 张"
+            )
             QMessageBox.warning(
                 self, "部分图片移动失败", "\n".join(result_lines)
             )
         else:
             self.output.setPlainText("\n".join(result_lines))
-            self._set_status(f"完成：已移动 {moved} 张图片（跳过 {skipped} 张）")
+            self._set_status(
+                f"完成：已移动 {result.moved} 张图片"
+                f"（跳过 {result.skipped} 张）"
+            )
             QMessageBox.information(
-                self, "移动完成", f"已移动 {moved} 张图片。"
+                self, "移动完成", f"已移动 {result.moved} 张图片。"
             )
 
+    def _on_move_cancelled(self, result: object) -> None:
+        partial = result if isinstance(result, MoveExecutionResult) else None
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if partial is not None and partial.moved_items:
+            self._undo_items = list(partial.moved_items)
+            self._refresh_undo_button()
+
+        moved = partial.moved if partial is not None else 0
+        skipped = partial.skipped if partial is not None else 0
+        errors = partial.errors if partial is not None else []
+        result_lines = [
+            f"已取消：移动 {moved} 张图片，跳过 {skipped} 张。"
+        ]
+        if errors:
+            result_lines.append("")
+            result_lines.append(f"失败 {len(errors)} 项：")
+            result_lines.extend(errors)
+        self.output.setPlainText("\n".join(result_lines))
+        if errors:
+            self._set_status(
+                f"已取消：移动 {moved} 张，失败 {len(errors)} 张"
+            )
+        else:
+            self._set_status(f"已取消：移动 {moved} 张图片")
+
+    def _on_move_failed(self, message: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status("移动失败")
+        QMessageBox.critical(self, "移动失败", message)
+
+    # --------------------------------------------------------------- 撤销流程
+
+    @staticmethod
+    def _remaining_undo_items(
+        record: list[tuple[Path, Path]],
+        moved_items: list[tuple[Path, Path]],
+    ) -> list[tuple[Path, Path]]:
+        moved_pairs = {
+            (Path(src), Path(dst)) for src, dst in moved_items
+        }
+        return [
+            (src, dst)
+            for src, dst in record
+            if (Path(dst), Path(src)) not in moved_pairs
+        ]
+
     def _undo_move(self) -> None:
-        if not self._undo_items:
+        if self._busy or not self._undo_items:
             return
 
         record = list(self._undo_items)
-        available = [(dst, src) for src, dst in record if dst.exists()]
-        missing = len(record) - len(available)
-        if not available:
-            remove_empty_dirs([dst.parent for _src, dst in record])
-            self._undo_items = []
-            self._refresh_undo_button()
-            self.output.setPlainText(
-                "撤销未执行：上次移动的图片已不在对应的子文件夹中。"
-            )
-            QMessageBox.information(
-                self,
-                "没有可撤销的文件",
-                "上次移动的图片已不在对应的子文件夹中，无法撤销。",
-            )
-            self._set_status("没有可撤销的文件")
-            return
+        reversed_items = [(dst, src) for src, dst in record]
 
-        conflicts = find_conflicts(available)
+        def task(
+            on_progress: Callable[[object, object], None],
+            cancel_event: threading.Event,
+        ) -> list[tuple[Path, Path]]:
+            return find_conflicts(
+                reversed_items,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+            )
+
+        self._pending_undo = None
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_busy(True)
+        self._set_status("正在检查原位置同名文件…")
+        self._start_worker(
+            task,
+            self._on_undo_prepare_finished,
+            self._on_undo_prepare_cancelled,
+            self._on_undo_failed,
+            self._on_undo_prepare_progress,
+        )
+
+    def _on_undo_prepare_progress(
+        self, done: object, total: object
+    ) -> None:
+        done_count, total_count = int(done), int(total)
+        percent = int(done_count / total_count * 100) if total_count else 0
+        self.progress_bar.setValue(min(100, percent))
+        self._set_status(
+            f"正在检查原位置同名文件：{done_count}/{total_count} 张…"
+        )
+
+    def _on_undo_prepare_finished(self, result: object) -> None:
+        if not isinstance(result, list):
+            self._on_undo_failed("撤销准备返回了未知结果")
+            return
+        record = list(self._undo_items)
+        reversed_items = [(dst, src) for src, dst in record]
+        self.progress_bar.setValue(0)
+        # 等 worker 的 finished 信号后再显示对话框并启动执行 worker。
+        self._pending_undo = (record, reversed_items, result)
+
+    def _on_undo_prepare_cancelled(self, _result: object) -> None:
+        self.progress_bar.setValue(0)
+        self._set_status("已取消撤销")
+
+    def _continue_undo(
+        self,
+        record: list[tuple[Path, Path]],
+        reversed_items: list[tuple[Path, Path]],
+        conflicts: list[tuple[Path, Path]],
+    ) -> None:
+        known_conflicts = {dst for _src, dst in conflicts}
         overwrite = False
         if conflicts:
             policy = self._ask_conflict_policy(len(conflicts), "原文件夹")
@@ -567,9 +1024,7 @@ class MoveImagesPage(ToolPage):
                 return
             overwrite = policy
 
-        message = f"将把上次移动的 {len(available)} 张图片移回原文件夹。"
-        if missing:
-            message += f"\n另有 {missing} 张图片已不在子文件夹中，无法移回。"
+        message = f"将把上次移动的 {len(record)} 张图片移回原文件夹。"
         if conflicts:
             action = "覆盖" if overwrite else "跳过"
             message += f"\n原文件夹中有 {len(conflicts)} 个同名文件（{action}）。"
@@ -585,45 +1040,158 @@ class MoveImagesPage(ToolPage):
             self._set_status("已取消撤销")
             return
 
+        self._start_undo_worker(
+            record, reversed_items, overwrite, known_conflicts
+        )
+
+    def _start_undo_worker(
+        self,
+        record: list[tuple[Path, Path]],
+        reversed_items: list[tuple[Path, Path]],
+        overwrite: bool,
+        known_conflicts: set[Path],
+    ) -> None:
         subdirs = {dst.parent for _src, dst in record}
+
+        def task(
+            on_progress: Callable[[object, object], None],
+            cancel_event: threading.Event,
+        ) -> tuple[MoveExecutionResult, list[tuple[Path, Path]]]:
+            try:
+                result = execute_moves(
+                    reversed_items,
+                    overwrite=overwrite,
+                    known_conflicts=known_conflicts,
+                    cancel_event=cancel_event,
+                    on_progress=on_progress,
+                    error_formatter=lambda src, dst, exc: (
+                        f"{src} → {dst}：{exc}"
+                    ),
+                )
+            except Cancelled as exc:
+                partial = (
+                    exc.result
+                    if isinstance(exc.result, MoveExecutionResult)
+                    else MoveExecutionResult()
+                )
+                remove_empty_dirs(list(subdirs))
+                remaining = self._remaining_undo_items(
+                    record, partial.moved_items
+                )
+                raise Cancelled((partial, remaining)) from exc
+            remove_empty_dirs(list(subdirs))
+            remaining = self._remaining_undo_items(
+                record, result.moved_items
+            )
+            return result, remaining
+
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self._set_busy(True)
-        try:
-            moved, skipped, errors, _ = execute_moves(
-                available, overwrite=overwrite
-            )
-        finally:
-            self._set_busy(False)
+        self._set_status(f"正在撤销：移回 {len(record)} 张图片…")
+        self._start_worker(
+            task,
+            self._on_undo_finished,
+            self._on_undo_cancelled,
+            self._on_undo_failed,
+            self._on_undo_progress,
+        )
 
-        remove_empty_dirs(list(subdirs))
+    def _on_undo_progress(self, done: object, total: object) -> None:
+        done_count, total_count = int(done), int(total)
+        percent = int(done_count / total_count * 100) if total_count else 0
+        self.progress_bar.setValue(min(100, percent))
+        self._set_status(f"正在撤销：{done_count}/{total_count} 张…")
 
-        result_lines = [f"撤销完成：已移回 {moved} 张图片，跳过 {skipped} 张。"]
-        if missing:
-            result_lines.append(
-                f"另有 {missing} 张图片已不在原来的子文件夹中，未处理。"
-            )
+    def _on_undo_finished(self, result: object) -> None:
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], MoveExecutionResult)
+        ):
+            self._on_undo_failed("撤销返回了无法识别的结果。")
+            return
+
+        move_result, remaining = result
+        self.progress_bar.setValue(100)
+        self._undo_items = list(remaining)
+        self._refresh_undo_button()
+
+        moved = move_result.moved
+        skipped = move_result.skipped
+        errors = move_result.errors
+        result_lines = [
+            f"撤销完成：已移回 {moved} 张图片，跳过 {skipped} 张。"
+        ]
         if errors:
             result_lines.append("")
             result_lines.append(f"失败 {len(errors)} 项：")
             result_lines.extend(errors)
 
-        self._undo_items = [(src, dst) for src, dst in record if dst.exists()]
-        self._refresh_undo_button()
         self.output.setPlainText("\n".join(result_lines))
 
         if errors:
-            self._set_status(f"撤销完成：移回 {moved} 张，失败 {len(errors)} 张")
+            self._set_status(
+                f"撤销完成：移回 {moved} 张，失败 {len(errors)} 张"
+            )
             QMessageBox.warning(
                 self, "部分图片撤销失败", "\n".join(result_lines)
             )
         else:
-            remaining = len(self._undo_items)
-            extra = f"，仍有 {remaining} 张可继续撤销" if remaining else ""
+            remaining_count = len(self._undo_items)
+            extra = (
+                f"，仍有 {remaining_count} 张可继续撤销"
+                if remaining_count
+                else ""
+            )
             self._set_status(
-                f"撤销完成：已移回 {moved} 张图片（跳过 {skipped} 张）{extra}"
+                f"撤销完成：已移回 {moved} 张图片"
+                f"（跳过 {skipped} 张）{extra}"
             )
             QMessageBox.information(
                 self, "撤销完成", f"已移回 {moved} 张图片。"
             )
+
+    def _on_undo_cancelled(self, result: object) -> None:
+        partial: MoveExecutionResult | None = None
+        remaining: list[tuple[Path, Path]] | None = None
+        if isinstance(result, tuple) and len(result) == 2:
+            if isinstance(result[0], MoveExecutionResult):
+                partial = result[0]
+            if isinstance(result[1], list):
+                remaining = result[1]
+        elif isinstance(result, MoveExecutionResult):
+            partial = result
+
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if remaining is not None:
+            self._undo_items = list(remaining)
+            self._refresh_undo_button()
+
+        moved = partial.moved if partial is not None else 0
+        skipped = partial.skipped if partial is not None else 0
+        errors = partial.errors if partial is not None else []
+        result_lines = [
+            f"已取消撤销：已移回 {moved} 张图片，跳过 {skipped} 张。"
+        ]
+        if errors:
+            result_lines.append("")
+            result_lines.append(f"失败 {len(errors)} 项：")
+            result_lines.extend(errors)
+        self.output.setPlainText("\n".join(result_lines))
+        if errors:
+            self._set_status(
+                f"已取消撤销：移回 {moved} 张，失败 {len(errors)} 张"
+            )
+        else:
+            self._set_status(f"已取消撤销：移回 {moved} 张图片")
+
+    def _on_undo_failed(self, message: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status("撤销失败")
+        QMessageBox.critical(self, "撤销失败", message)
 
     def _open_folder(self) -> None:
         folder_text = self.folder_edit.text().strip()

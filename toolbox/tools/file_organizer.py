@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import cached_property
 from pathlib import Path
 
+from PyQt6.QtCore import QThread
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -34,15 +37,20 @@ from PyQt6.QtWidgets import (
 )
 
 from toolbox.common import (
+    UniquePathAllocator,
     natural_path_key,
     natural_sort_key,
     open_directory,
-    unique_path,
 )
-from toolbox.fileops import prune_empty_dirs, remove_empty_dirs
+from toolbox.fileops import (
+    MoveExecutionResult,
+    execute_moves,
+    prune_empty_dirs,
+    remove_empty_dirs,
+)
 from toolbox.page import ToolPage
 from toolbox.ui import add_path_row, make_form
-from toolbox.workers import Cancelled, SingleTaskWorker, shutdown_worker
+from toolbox.workers import Cancelled, SingleTaskWorker
 
 MODE_EXTENSION = "extension"
 MODE_MTIME = "mtime"
@@ -142,20 +150,22 @@ class OrganizePlan:
     target_root: Path
     items: list[OrganizeItem] = field(default_factory=list)
     skipped: list[tuple[Path, str]] = field(default_factory=list)
+    #: (目录路径, st_mtime_ns) 快照，供界面判断计划是否仍然有效。
+    fingerprint: tuple[tuple[str, int], ...] = ()
 
-    @property
+    @cached_property
     def move_items(self) -> list[OrganizeItem]:
         """返回真正会移动的条目（状态为 ``ok``）。"""
         return [item for item in self.items if item.status == STATUS_OK]
 
-    @property
+    @cached_property
     def conflict_count(self) -> int:
         """返回目标已存在、执行时将跳过的条目数。"""
         return sum(
             1 for item in self.items if item.status == STATUS_CONFLICT
         )
 
-    @property
+    @cached_property
     def skipped_count(self) -> int:
         """返回预览中定义为跳过的文件总数。"""
         status_skipped = sum(
@@ -163,7 +173,7 @@ class OrganizePlan:
         )
         return self.conflict_count + status_skipped + len(self.skipped)
 
-    @property
+    @cached_property
     def buckets(self) -> list[str]:
         """返回计划中出现的分类桶（自然排序）。"""
         return sorted(
@@ -193,18 +203,45 @@ def _same_path(first: Path, second: Path) -> bool:
     )
 
 
-def _destination_taken(path: Path) -> bool:
-    """目标位置是否已被占用（包括失效的符号链接）。"""
-    return path.exists() or path.is_symlink()
+def _destination_taken(
+    path: Path, name_index: dict[Path, set[str]] | None = None
+) -> bool:
+    """目标位置是否已被占用（包括失效的符号链接）。
+
+    传入 ``name_index`` 时按目标目录惰性建立一次名字索引（``normcase``
+    键），批量生成计划时避免对同一目录反复 stat；不传时保持逐项检查。
+    """
+    if name_index is None:
+        return path.exists() or path.is_symlink()
+
+    names = name_index.get(path.parent)
+    if names is None:
+        names = set()
+        try:
+            with os.scandir(path.parent) as entries:
+                for entry in entries:
+                    names.add(os.path.normcase(entry.name))
+        except OSError:
+            pass
+        name_index[path.parent] = names
+    return os.path.normcase(path.name) in names
 
 
-def classify_file(path: Path | str, mode: str) -> str:
+def classify_file(
+    path: Path | str,
+    mode: str,
+    *,
+    stat_result: os.stat_result | None = None,
+    mtime: float | None = None,
+) -> str:
     """按 ``mode`` 返回文件所属分类桶。
 
     - ``extension``：小写扩展名（不含点）；无扩展名返回「无扩展名」。
     - ``mtime``：本地修改时间 ``%Y-%m``。
     - ``category``：按 :data:`CATEGORY_MAP` 归类；无扩展名或未知扩展名
       归入「其他」。
+
+    已通过扫描拿到 ``stat_result`` 或 ``mtime`` 时可传入，避免再次 stat。
     """
     if mode not in VALID_MODES:
         raise ValueError(f"不支持的分类方式：{mode}")
@@ -214,7 +251,12 @@ def classify_file(path: Path | str, mode: str) -> str:
     if mode == MODE_EXTENSION:
         return suffix[1:] if suffix else NO_EXTENSION_BUCKET
     if mode == MODE_MTIME:
-        stamp = datetime.fromtimestamp(path.stat().st_mtime)
+        if mtime is None:
+            if stat_result is not None:
+                mtime = stat_result.st_mtime
+            else:
+                mtime = path.stat().st_mtime
+        stamp = datetime.fromtimestamp(mtime)
         return stamp.strftime("%Y-%m")
     if not suffix:
         return OTHER_CATEGORY
@@ -238,6 +280,8 @@ def build_organize_plan(
     root: Path | str,
     target_root: Path | str,
     options: OrganizeOptions,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> OrganizePlan:
     """扫描源目录并生成整理计划（不会移动任何文件）。
 
@@ -262,39 +306,58 @@ def build_organize_plan(
         not target_is_root
         and target_resolved.is_relative_to(root_resolved)
     )
+    target_relative: Path | None = None
+    if target_inside:
+        try:
+            target_relative = target_resolved.relative_to(root_resolved)
+        except ValueError:
+            target_relative = None
 
     items: list[OrganizeItem] = []
     skipped: list[tuple[Path, str]] = []
+    fingerprint: list[tuple[str, int]] = []
+    resolved_dirs: dict[Path, Path] = {}
+    destination_names: dict[Path, set[str]] = {}
+    allocator = UniquePathAllocator(reserve_planned=False)
+
+    def check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled()
 
     def record_skip(path: Path, reason: str) -> None:
         skipped.append((path, reason))
 
-    def process_file(path: Path) -> None:
-        try:
-            if path.is_symlink():
-                record_skip(path, "符号链接")
-                return
-            if not path.is_file():
-                if not path.is_dir():
-                    record_skip(path, "不是普通文件")
-                return
-        except OSError as exc:
-            record_skip(path, f"无法读取文件信息：{exc}")
-            return
+    def resolved_directory(directory: Path) -> Path:
+        cached = resolved_dirs.get(directory)
+        if cached is None:
+            cached = _resolved(directory)
+            resolved_dirs[directory] = cached
+        return cached
 
+    def same_as_source(destination: Path, relative: Path) -> bool:
+        """用「已解析根 + 相对路径」比较，避免逐文件两次 resolve。"""
+        source = root_resolved / relative
+        target = resolved_directory(destination.parent) / destination.name
+        return os.path.normcase(str(source)) == os.path.normcase(
+            str(target)
+        )
+
+    def process_file(
+        path: Path, relative: Path, info: os.stat_result
+    ) -> None:
         if not options.include_hidden and path.name.startswith("."):
             record_skip(path, "隐藏文件")
             return
 
         try:
-            bucket = classify_file(path, options.mode)
+            bucket = classify_file(
+                path, options.mode, stat_result=info
+            )
         except OSError as exc:
             record_skip(path, f"无法读取修改时间：{exc}")
             return
 
-        relative_parent = (
-            path.parent.relative_to(root) if options.recursive else Path()
-        )
+        relative_parent = relative.parent
         if (
             options.recursive
             and target_is_root
@@ -308,16 +371,16 @@ def build_organize_plan(
             destination = destination / relative_parent
         destination = destination / path.name
 
-        if _same_path(destination, path):
+        if same_as_source(destination, relative):
             record_skip(path, "目标与源相同")
             return
 
         status = STATUS_OK
-        if _destination_taken(destination):
+        if _destination_taken(destination, destination_names):
             if options.conflict_policy == CONFLICT_SKIP:
                 status = STATUS_CONFLICT
             else:
-                destination = unique_path(destination)
+                destination = allocator.reserve(destination)
 
         items.append(
             OrganizeItem(
@@ -325,35 +388,59 @@ def build_organize_plan(
             )
         )
 
-    def on_walk_error(error: OSError) -> None:
-        filename = getattr(error, "filename", None)
-        target = Path(filename) if filename else root
-        record_skip(target, f"无法读取目录：{error}")
+    def process_directory(directory: Path, relative: Path) -> None:
+        check_cancelled()
+        try:
+            info = os.stat(directory, follow_symlinks=False)
+        except OSError:
+            pass
+        else:
+            fingerprint.append((str(directory), info.st_mtime_ns))
 
-    if options.recursive:
-        for dirpath, dirnames, filenames in os.walk(
-            root,
-            topdown=True,
-            followlinks=False,
-            onerror=on_walk_error,
-        ):
-            current = Path(dirpath)
-            kept_dirs: list[str] = []
-            for name in dirnames:
-                if not options.include_hidden and name.startswith("."):
-                    continue
-                if target_inside and _same_path(
-                    current / name, target_root
+        try:
+            with os.scandir(directory) as scan:
+                entries = list(scan)
+        except OSError as exc:
+            record_skip(directory, f"无法读取目录：{exc}")
+            return
+
+        for entry in entries:
+            check_cancelled()
+            path = Path(entry.path)
+            entry_relative = relative / entry.name
+            if not options.include_hidden and entry.name.startswith("."):
+                # 隐藏目录静默跳过，隐藏文件记录为跳过项。
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_dir = False
+                if not is_dir:
+                    record_skip(path, "隐藏文件")
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                record_skip(path, f"无法读取文件信息：{exc}")
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                record_skip(path, "符号链接")
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                if (
+                    target_inside
+                    and target_relative is not None
+                    and entry_relative == target_relative
                 ):
                     continue
-                kept_dirs.append(name)
-            dirnames[:] = sorted(kept_dirs, key=natural_sort_key)
+                if options.recursive:
+                    process_directory(path, entry_relative)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                record_skip(path, "不是普通文件")
+                continue
+            process_file(path, entry_relative, info)
 
-            for name in sorted(filenames, key=natural_sort_key):
-                process_file(current / name)
-    else:
-        for entry in sorted(root.iterdir(), key=natural_path_key):
-            process_file(entry)
+    process_directory(root, Path())
 
     items.sort(
         key=lambda item: (item.bucket, natural_path_key(item.src))
@@ -365,6 +452,7 @@ def build_organize_plan(
         target_root=target_root,
         items=items,
         skipped=skipped,
+        fingerprint=tuple(fingerprint),
     )
 
 
@@ -375,42 +463,39 @@ def execute_organize(
 ) -> OrganizeResult:
     """按计划移动状态为 ``ok`` 的文件。
 
-    逐项执行，单项失败不影响后续文件，也不会覆盖目标位置的文件（执行时
-    才出现的同名文件计为跳过）。取消时抛出
-    :class:`toolbox.workers.Cancelled`，其 ``result`` 携带已完成的部分结果。
+    复用 :func:`toolbox.fileops.execute_moves`：单项失败不影响后续文件，
+    也不会覆盖目标位置的文件（执行时才出现的同名文件计为跳过）。取消时
+    转换为 :class:`toolbox.workers.Cancelled`，其 ``result`` 是携带已完成
+    部分结果的 :class:`OrganizeResult`。
     """
-    moved: list[tuple[Path, Path]] = []
-    skipped = sum(1 for item in plan.items if item.status != STATUS_OK)
-    errors: list[str] = []
     pending = [item for item in plan.items if item.status == STATUS_OK]
-    total = len(pending)
-    processed = 0
+    skipped = len(plan.items) - len(pending)
 
-    for item in pending:
-        if cancel_event is not None and cancel_event.is_set():
-            raise Cancelled(
-                OrganizeResult(
-                    moved=list(moved), skipped=skipped, errors=list(errors)
-                )
+    try:
+        result = execute_moves(
+            [(item.src, item.dst) for item in pending],
+            overwrite=False,
+            cancel_event=cancel_event,
+            on_progress=on_progress,
+            error_formatter=lambda src, dst, exc: f"{src} → {dst}：{exc}",
+        )
+    except Cancelled as exc:
+        partial = exc.result
+        if isinstance(partial, MoveExecutionResult):
+            converted = OrganizeResult(
+                moved=list(partial.moved_items),
+                skipped=skipped + partial.skipped,
+                errors=list(partial.errors),
             )
+        else:
+            converted = OrganizeResult(skipped=skipped)
+        raise Cancelled(converted) from exc
 
-        try:
-            if _destination_taken(item.dst) or _same_path(
-                item.src, item.dst
-            ):
-                skipped += 1
-            else:
-                item.dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(item.src), str(item.dst))
-                moved.append((item.src, item.dst))
-        except Exception as exc:  # noqa: BLE001 - 单项失败继续
-            errors.append(f"{item.src} → {item.dst}：{exc}")
-
-        processed += 1
-        if on_progress is not None:
-            on_progress(processed, total)
-
-    return OrganizeResult(moved=moved, skipped=skipped, errors=errors)
+    return OrganizeResult(
+        moved=list(result.moved_items),
+        skipped=skipped + result.skipped,
+        errors=list(result.errors),
+    )
 
 
 def _cleanup_after_undo(
@@ -510,13 +595,29 @@ def _format_error_lines(errors: Sequence[str], limit: int = 5) -> list[str]:
 class FileOrganizerPage(ToolPage):
     """按扩展名 / 修改日期 / 文件大类整理文件的工具页。"""
 
+    shutdown_label = "整理"
+
     def __init__(self) -> None:
         super().__init__()
         self._worker: SingleTaskWorker | None = None
+        self._pending_action: str | None = None
         self._executing_plan: OrganizePlan | None = None
         self._undo_records: list[tuple[Path, Path]] = []
         self._undo_target_root: Path | None = None
+        self._plan_cache: OrganizePlan | None = None
+        self._plan_key: (
+            tuple[Path, Path, OrganizeOptions] | None
+        ) = None
+        self._plan_inputs: (
+            tuple[Path, Path, OrganizeOptions] | None
+        ) = None
+        self._pending_execute: (
+            tuple[OrganizePlan, OrganizeOptions] | None
+        ) = None
         self._build_ui()
+
+    def current_worker(self) -> QThread | None:
+        return self._worker
 
     # ------------------------------------------------------------------ UI
 
@@ -729,18 +830,57 @@ class FileOrganizerPage(ToolPage):
         )
         return root, target_root, options
 
-    def _make_plan(self) -> OrganizePlan | None:
-        collected = self._collect_options()
-        if collected is None:
+    @staticmethod
+    def _make_plan(
+        root: Path,
+        target_root: Path,
+        options: OrganizeOptions,
+        cancel_event: threading.Event | None = None,
+    ) -> OrganizePlan:
+        """纯函数包装：只生成计划，不访问任何界面控件。"""
+        return build_organize_plan(
+            root,
+            target_root,
+            options,
+            cancel_event=cancel_event,
+        )
+
+    @staticmethod
+    def _plan_fingerprint_current(plan: OrganizePlan) -> bool:
+        if not plan.fingerprint:
+            return False
+        for directory, mtime_ns in plan.fingerprint:
+            try:
+                if Path(directory).stat().st_mtime_ns != mtime_ns:
+                    return False
+            except OSError:
+                return False
+        return True
+
+    def _cached_plan(
+        self,
+        root: Path,
+        target_root: Path,
+        options: OrganizeOptions,
+    ) -> OrganizePlan | None:
+        plan = self._plan_cache
+        if plan is None:
             return None
-        root, target_root, options = collected
-        try:
-            return build_organize_plan(root, target_root, options)
-        except (OSError, ValueError) as exc:
-            QMessageBox.critical(
-                self, "无法生成整理计划", f"{root}\n{exc}"
-            )
+        if self._plan_key != (root, target_root, options):
             return None
+        if not self._plan_fingerprint_current(plan):
+            return None
+        return plan
+
+    def _remember_plan(
+        self,
+        plan: OrganizePlan,
+        root: Path,
+        target_root: Path,
+        options: OrganizeOptions,
+    ) -> None:
+        self._plan_cache = plan
+        self._plan_key = (root, target_root, options)
 
     def _display_path(self, path: Path, base: Path) -> str:
         try:
@@ -751,43 +891,55 @@ class FileOrganizerPage(ToolPage):
         return text if text not in {"", "."} else str(path)
 
     def _fill_table(self, plan: OrganizePlan) -> None:
-        rows = len(plan.items) + len(plan.skipped)
-        self.table.setRowCount(rows)
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            rows = len(plan.items) + len(plan.skipped)
+            self.table.setRowCount(rows)
 
-        for row, item in enumerate(plan.items):
-            source_item = QTableWidgetItem(
-                self._display_path(item.src, plan.root)
-            )
-            source_item.setToolTip(str(item.src))
-            bucket_item = QTableWidgetItem(item.bucket)
-            destination_item = QTableWidgetItem(
-                self._display_path(item.dst, plan.target_root)
-            )
-            destination_item.setToolTip(str(item.dst))
-            status_item = QTableWidgetItem(
-                STATUS_LABELS.get(item.status, item.status)
-            )
-            if item.status == STATUS_CONFLICT:
-                status_item.setToolTip(
-                    "目标位置已存在同名文件，执行时将跳过"
+            for row, item in enumerate(plan.items):
+                source_item = QTableWidgetItem(
+                    self._display_path(item.src, plan.root)
                 )
-            self.table.setItem(row, 0, source_item)
-            self.table.setItem(row, 1, bucket_item)
-            self.table.setItem(row, 2, destination_item)
-            self.table.setItem(row, 3, status_item)
+                source_item.setToolTip(str(item.src))
+                bucket_item = QTableWidgetItem(item.bucket)
+                destination_item = QTableWidgetItem(
+                    self._display_path(item.dst, plan.target_root)
+                )
+                destination_item.setToolTip(str(item.dst))
+                status_item = QTableWidgetItem(
+                    STATUS_LABELS.get(item.status, item.status)
+                )
+                if item.status == STATUS_CONFLICT:
+                    status_item.setToolTip(
+                        "目标位置已存在同名文件，执行时将跳过"
+                    )
+                self.table.setItem(row, 0, source_item)
+                self.table.setItem(row, 1, bucket_item)
+                self.table.setItem(row, 2, destination_item)
+                self.table.setItem(row, 3, status_item)
 
-        offset = len(plan.items)
-        for index, (path, reason) in enumerate(plan.skipped):
-            source_item = QTableWidgetItem(
-                self._display_path(path, plan.root)
-            )
-            source_item.setToolTip(f"{path}\n{reason}")
-            status_item = QTableWidgetItem(STATUS_LABELS[STATUS_SKIPPED])
-            status_item.setToolTip(reason)
-            self.table.setItem(offset + index, 0, source_item)
-            self.table.setItem(offset + index, 1, QTableWidgetItem("—"))
-            self.table.setItem(offset + index, 2, QTableWidgetItem("—"))
-            self.table.setItem(offset + index, 3, status_item)
+            offset = len(plan.items)
+            for index, (path, reason) in enumerate(plan.skipped):
+                source_item = QTableWidgetItem(
+                    self._display_path(path, plan.root)
+                )
+                source_item.setToolTip(f"{path}\n{reason}")
+                status_item = QTableWidgetItem(
+                    STATUS_LABELS[STATUS_SKIPPED]
+                )
+                status_item.setToolTip(reason)
+                self.table.setItem(offset + index, 0, source_item)
+                self.table.setItem(
+                    offset + index, 1, QTableWidgetItem("—")
+                )
+                self.table.setItem(
+                    offset + index, 2, QTableWidgetItem("—")
+                )
+                self.table.setItem(offset + index, 3, status_item)
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
 
     def _summary_text(self, plan: OrganizePlan) -> str:
         move_count = len(plan.move_items)
@@ -796,28 +948,161 @@ class FileOrganizerPage(ToolPage):
             f"共 {len(plan.buckets)} 个分类。"
         )
 
+    def _start_scan_worker(
+        self,
+        root: Path,
+        target_root: Path,
+        options: OrganizeOptions,
+        action: str,
+        status_text: str,
+    ) -> None:
+        def task(
+            on_progress: Callable[[object, object], None],
+            cancel_event: threading.Event,
+        ) -> object:
+            plan = self._make_plan(
+                root, target_root, options, cancel_event
+            )
+            if cancel_event.is_set():
+                raise Cancelled(plan)
+            return plan
+
+        self._plan_inputs = (root, target_root, options)
+        self._pending_execute = None
+        self._begin_worker(
+            task, action, status_text, indeterminate=True
+        )
+
+    def _begin_worker(
+        self,
+        task: Callable[
+            [Callable[[object, object], None], threading.Event], object
+        ],
+        action: str,
+        status_text: str,
+        *,
+        indeterminate: bool = False,
+    ) -> None:
+        self._pending_action = action
+        if indeterminate:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+        self._set_status(status_text)
+        self._set_busy(True)
+
+        worker = SingleTaskWorker(task, self)
+        if not indeterminate:
+            if action == "undo":
+                worker.progress_changed.connect(self._on_undo_progress)
+            else:
+                worker.progress_changed.connect(self._on_progress)
+        worker.task_finished.connect(self._on_worker_result)
+        worker.task_cancelled.connect(self._on_worker_cancelled)
+        worker.task_failed.connect(self._on_task_failed)
+        worker.finished.connect(self._on_worker_finished)
+        self._worker = worker
+        worker.start()
+
+    def _on_worker_result(self, result: object) -> None:
+        action = self._pending_action
+        if action in {"preview", "plan_execute"}:
+            self._on_plan_ready(result)
+        elif action == "run":
+            self._on_task_finished(result)
+        elif action == "undo":
+            self._on_undo_finished(result)
+        else:
+            self._on_task_failed("后台任务返回了未知结果")
+
+    def _on_worker_cancelled(self, result: object) -> None:
+        if self._pending_action in {"preview", "plan_execute"}:
+            self._on_plan_cancelled()
+        elif self._pending_action == "run":
+            self._on_task_cancelled(result)
+        elif self._pending_action == "undo":
+            self._on_undo_cancelled(result)
+
+    def _on_plan_ready(self, result: object) -> None:
+        if not isinstance(result, OrganizePlan):
+            self._on_task_failed("后台任务返回了未知结果")
+            return
+        inputs = self._plan_inputs
+        if inputs is None:
+            self._on_task_failed("后台任务缺少计划输入")
+            return
+        root, target_root, options = inputs
+        self._remember_plan(result, root, target_root, options)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._fill_table(result)
+        if self._pending_action == "plan_execute":
+            self._set_status(f"预览：{self._summary_text(result)}")
+            self._pending_execute = (result, options)
+        else:
+            self._set_status(
+                f"预览完成：{self._summary_text(result)}"
+            )
+
+    def _on_plan_cancelled(self) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if self._pending_action == "plan_execute":
+            self._set_status("已取消整理")
+        else:
+            self._set_status("已取消预览")
+
     def _preview(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             return
-        plan = self._make_plan()
-        if plan is None:
+        collected = self._collect_options()
+        if collected is None:
             return
-        self._fill_table(plan)
-        self.progress_bar.setValue(0)
-        self._set_status(f"预览完成：{self._summary_text(plan)}")
+        root, target_root, options = collected
+        cached = self._cached_plan(root, target_root, options)
+        if cached is not None:
+            self._fill_table(cached)
+            self.progress_bar.setValue(0)
+            self._set_status(
+                f"预览完成：{self._summary_text(cached)}"
+            )
+            return
+        self._start_scan_worker(
+            root,
+            target_root,
+            options,
+            "preview",
+            "正在扫描文件…",
+        )
 
     # ------------------------------------------------------------------ 执行
 
     def _start_execute(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             return
-        plan = self._make_plan()
-        if plan is None:
+        collected = self._collect_options()
+        if collected is None:
             return
+        root, target_root, options = collected
+        cached = self._cached_plan(root, target_root, options)
+        if cached is not None:
+            self._fill_table(cached)
+            self._set_status(f"预览：{self._summary_text(cached)}")
+            self._request_execute(cached, options)
+            return
+        self._start_scan_worker(
+            root,
+            target_root,
+            options,
+            "plan_execute",
+            "正在扫描文件…",
+        )
 
-        self._fill_table(plan)
+    def _request_execute(
+        self, plan: OrganizePlan, options: OrganizeOptions
+    ) -> None:
         move_count = len(plan.move_items)
-        self._set_status(f"预览：{self._summary_text(plan)}")
         if move_count == 0:
             QMessageBox.information(
                 self,
@@ -826,11 +1111,6 @@ class FileOrganizerPage(ToolPage):
             )
             self._set_status("没有可移动的文件")
             return
-
-        collected = self._collect_options()
-        if collected is None:
-            return
-        _root, _target_root, options = collected
 
         message = (
             f"将把 {move_count} 个文件移动到：\n{plan.target_root}\n\n"
@@ -878,28 +1158,11 @@ class FileOrganizerPage(ToolPage):
             return result
 
         self._executing_plan = plan
-        self._begin_worker(task, move_count)
-
-    def _begin_worker(
-        self,
-        task: Callable[
-            [Callable[[object, object], None], threading.Event], object
-        ],
-        total: int,
-    ) -> None:
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self._set_status(f"正在整理 {total} 个文件…")
-        self._set_busy(True)
-
-        worker = SingleTaskWorker(task, self)
-        worker.progress_changed.connect(self._on_progress)
-        worker.task_finished.connect(self._on_task_finished)
-        worker.task_cancelled.connect(self._on_task_cancelled)
-        worker.task_failed.connect(self._on_task_failed)
-        worker.finished.connect(self._on_worker_finished)
-        self._worker = worker
-        worker.start()
+        self._begin_worker(
+            task,
+            "run",
+            f"正在整理 {move_count} 个文件…",
+        )
 
     def _on_progress(self, done: object, total: object) -> None:
         done_count, total_count = int(done), int(total)
@@ -970,16 +1233,29 @@ class FileOrganizerPage(ToolPage):
             QMessageBox.information(self, "已取消", "\n".join(lines))
 
     def _on_task_failed(self, message: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if self._pending_action in {"preview", "plan_execute"}:
+            self._set_status("无法生成整理计划")
+            QMessageBox.critical(
+                self, "无法生成整理计划", message
+            )
+            return
         self._set_status("整理失败")
         QMessageBox.critical(self, "整理失败", message)
 
     def _on_worker_finished(self) -> None:
         worker = self._worker
         self._worker = None
+        self._pending_action = None
         self._executing_plan = None
         if worker is not None:
             worker.deleteLater()
         self._set_busy(False)
+        pending = self._pending_execute
+        self._pending_execute = None
+        if pending is not None:
+            self._request_execute(*pending)
 
     def _cancel_task(self) -> None:
         if self._worker is None or not self._worker.isRunning():
@@ -1010,10 +1286,6 @@ class FileOrganizerPage(ToolPage):
 
         records = list(self._undo_records)
         target_root = self._undo_target_root
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self._set_busy(True)
-        self._set_status(f"正在撤销：移回 {len(records)} 个文件…")
 
         def task(
             on_progress: Callable[[object, object], None],
@@ -1026,14 +1298,11 @@ class FileOrganizerPage(ToolPage):
                 on_progress=on_progress,
             )
 
-        worker = SingleTaskWorker(task, self)
-        worker.progress_changed.connect(self._on_undo_progress)
-        worker.task_finished.connect(self._on_undo_finished)
-        worker.task_cancelled.connect(self._on_undo_cancelled)
-        worker.task_failed.connect(self._on_task_failed)
-        worker.finished.connect(self._on_worker_finished)
-        self._worker = worker
-        worker.start()
+        self._begin_worker(
+            task,
+            "undo",
+            f"正在撤销：移回 {len(records)} 个文件…",
+        )
 
     def _on_undo_progress(self, done: object, total: object) -> None:
         done_count, total_count = int(done), int(total)
@@ -1131,9 +1400,3 @@ class FileOrganizerPage(ToolPage):
             open_directory(folder)
         except Exception as exc:  # noqa: BLE001 - 打开失败时提示用户
             QMessageBox.critical(self, "无法打开目录", f"{folder}\n{exc}")
-
-    # ----------------------------------------------------------------- 关闭
-
-    def shutdown(self) -> bool:
-        """主窗口关闭前调用；整理进行中时确认并等待线程结束。"""
-        return shutdown_worker(self._worker, self.window(), "文件整理")
