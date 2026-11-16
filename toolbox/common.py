@@ -92,12 +92,9 @@ IMAGE_EXTENSIONS = {
 _NATURAL_TOKEN = re.compile(r"(\d+)")
 
 
-def natural_sort_key(text: str) -> tuple[tuple[int, int, str], ...]:
-    """按自然顺序比较字符串：数字段按数值，其余按归一化文本。
-
-    ``page_2`` 会排在 ``page_10`` 之前；对大小写、全半角差异做归一化。
-    """
-    normalized = unicodedata.normalize("NFKC", str(text)).casefold()
+@lru_cache(maxsize=65_536)
+def _natural_sort_key(text: str) -> tuple[tuple[int, int, str], ...]:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
     key: list[tuple[int, int, str]] = []
     for token in _NATURAL_TOKEN.split(normalized):
         if not token:
@@ -111,9 +108,30 @@ def natural_sort_key(text: str) -> tuple[tuple[int, int, str], ...]:
     return tuple(key)
 
 
+def natural_sort_key(text: str | Path) -> tuple[tuple[int, int, str], ...]:
+    """按自然顺序比较字符串：数字段按数值，其余按归一化文本。
+
+    ``page_2`` 会排在 ``page_10`` 之前；对大小写、全半角差异做归一化。
+    结果有界缓存，大目录排序时避免重复做 NFKC 归一化和正则切分。
+    """
+    return _natural_sort_key(str(text))
+
+
+@lru_cache(maxsize=65_536)
+def _natural_path_key(text: str) -> tuple:
+    return tuple(_natural_sort_key(part) for part in Path(text).parts)
+
+
 def natural_path_key(path: Path | str) -> tuple:
     """按自然顺序比较路径（逐级比较各路径片段）。"""
-    return tuple(natural_sort_key(part) for part in Path(path).parts)
+    return _natural_path_key(str(path))
+
+
+def clear_sort_caches() -> None:
+    """清空排序 / 文件系统键缓存（供测试或长期驻留进程使用）。"""
+    _natural_sort_key.cache_clear()
+    _natural_path_key.cache_clear()
+    _filesystem_key_cached.cache_clear()
 
 
 def human_size(size: int | float) -> str:
@@ -140,9 +158,73 @@ def unique_path(path: Path | str) -> Path:
     raise RuntimeError(f"无法为 {path} 生成不重复的文件名")
 
 
-def filesystem_key(name: str) -> str:
+@lru_cache(maxsize=65_536)
+def _filesystem_key_cached(name: str) -> str:
+    return unicodedata.normalize("NFC", os.path.normcase(name)).casefold()
+
+
+def filesystem_key(name: str | Path) -> str:
     """生成用于跨平台文件冲突比较的键（大小写不敏感 + Unicode NFC）。"""
-    return unicodedata.normalize("NFC", os.path.normcase(str(name))).casefold()
+    return _filesystem_key_cached(str(name))
+
+
+class UniquePathAllocator:
+    """批量生成不重复路径，避免对同一目录反复 stat / 从序号 1 重扫。
+
+    ``reserve_planned=True`` 时，已分配的路径也视为占用，保证同一批计划内
+    唯一（用于重复文件隔离区）；``reserve_planned=False`` 时只把传入瞬间
+    磁盘上已存在的名字视为占用，并对同一基础路径返回同一结果，保持
+    ``file_organizer`` 原有的“重复目标在执行时跳过”行为。
+    """
+
+    def __init__(self, *, reserve_planned: bool = True) -> None:
+        self._reserve_planned = reserve_planned
+        self._names: dict[Path, set[str]] = {}
+        self._next_index: dict[tuple[Path, str, str], int] = {}
+        self._reserved: dict[Path, Path] = {}
+
+    def _names_for(self, directory: Path) -> set[str]:
+        names = self._names.get(directory)
+        if names is None:
+            names = set()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        names.add(os.path.normcase(entry.name))
+            except OSError:
+                pass
+            self._names[directory] = names
+        return names
+
+    def reserve(self, path: Path | str) -> Path:
+        """返回一个可用路径；是否把它计入本批占用取决于初始化模式。"""
+        path = Path(path)
+        if not self._reserve_planned:
+            cached = self._reserved.get(path)
+            if cached is not None:
+                return cached
+
+        names = self._names_for(path.parent)
+        key = (path.parent, path.stem, path.suffix)
+        if os.path.normcase(path.name) not in names:
+            chosen = path
+        else:
+            index = self._next_index.get(key, 1)
+            while True:
+                candidate = path.with_name(
+                    f"{path.stem} ({index}){path.suffix}"
+                )
+                index += 1
+                if os.path.normcase(candidate.name) not in names:
+                    chosen = candidate
+                    break
+            self._next_index[key] = index
+
+        if self._reserve_planned:
+            names.add(os.path.normcase(chosen.name))
+        else:
+            self._reserved[path] = chosen
+        return chosen
 
 
 _FONT_FILE_CANDIDATES = (
